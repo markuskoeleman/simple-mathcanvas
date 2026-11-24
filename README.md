@@ -4,6 +4,7 @@
 | Keybind | Action |
 | :--- | :--- |
 | `z` | Undo |
+| `e` | Erase strokes |
 | `i` | Invert contrast |
 | `shift` | Hold to draw straight line |
 | `space` | Hold space to pan around |
