@@ -25,12 +25,18 @@ const STROKE_SAMPLE_DISTANCE_PX: f32 = 2.0;
 const STROKE_SIMPLIFICATION_RATIO: f32 = 0.5;
 
 const DEFAULT_STROKE_WIDTH: f32 = 2.2;
-const DEFAULT_STROKE_COLOR: [u8; 4] = [17, 24, 39, 255];
+const DEFAULT_STROKE_COLOR: [u8; 4] = [255, 255, 255, 255];
 
 // Maximum frequency for interactive canvas redraws.
 const INTERACTIVE_FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // ~60 FPS
 
-const BACKGROUND_PIXEL: u32 = 0x00F8_F9_FA;
+const BACKGROUND_PIXEL: u32 = 0x00000000;
+
+// xor colors to invert them
+const RGB_INVERT_MASK: u32 = 0x00FF_FFFF;
+
+// How long scrolling must stop before committing the final vector rendering.
+const ZOOM_SETTLE_DELAY: Duration = Duration::from_millis(180);
 
 // --- Serializable Vector Data Model ---
 
@@ -311,6 +317,9 @@ struct MathCanvasApp {
     is_drawing: bool,
     is_panning: bool,
     space_held: bool,
+    invert_contrast: bool,
+    invert_key_held: bool,
+
     cache_dirty: bool,
 
     // Drawing preview state
@@ -323,6 +332,8 @@ struct MathCanvasApp {
     // Temporary bitmap panning
     pan_origin: [f32; 2],
     pan_preview_offset: [i32; 2],
+    // Immutable snapshot of the packed canvas at pan start.
+    pan_source_frame: Option<Vec<u32>>,
 
     // Packed 0x00RRGGBB framebuffer, ready for softbuffer.
     packed_frame: Vec<u32>,
@@ -333,8 +344,12 @@ struct MathCanvasApp {
     // Damage history used to handle softbuffer's multiple buffers.
     damage_history: VecDeque<Option<PixelRect>>,
 
-    // Offset already applied to the packed image during panning.
-    pan_applied_offset: [i32; 2],
+    // Temporary bitmap zooming
+    is_zooming: bool,
+    zoom_source_frame: Option<Vec<u32>>,
+    zoom_origin: f32,
+    zoom_pan_origin: [f32; 2],
+    zoom_settle_deadline: Option<Instant>,
 
     current_stroke_color: [u8; 4],
     current_stroke_width: f32,
@@ -356,6 +371,8 @@ impl Default for MathCanvasApp {
             is_drawing: false,
             is_panning: false,
             space_held: false,
+            invert_contrast: false,
+            invert_key_held: false,
             cache_dirty: false,
 
             preview_points_rendered: 0,
@@ -365,11 +382,17 @@ impl Default for MathCanvasApp {
 
             pan_origin: [0.0, 0.0],
             pan_preview_offset: [0, 0],
+            pan_source_frame: None,
 
             packed_frame: Vec::new(),
             pending_damage: None,
             damage_history: VecDeque::new(),
-            pan_applied_offset: [0, 0],
+
+            is_zooming: false,
+            zoom_source_frame: None,
+            zoom_origin: 1.0,
+            zoom_pan_origin: [0.0, 0.0],
+            zoom_settle_deadline: None,
 
             current_stroke_color: DEFAULT_STROKE_COLOR,
             current_stroke_width: DEFAULT_STROKE_WIDTH,
@@ -415,7 +438,13 @@ impl MathCanvasApp {
             let g = src[1] as u32;
             let b = src[2] as u32;
 
-            *dst = (r << 16) | (g << 8) | b;
+            let pixel = (r << 16) | (g << 8) | b;
+
+            *dst = if self.invert_contrast {
+                pixel ^ RGB_INVERT_MASK
+            } else {
+                pixel
+            };
         }
 
         self.pending_damage = Some(PixelRect::full(width as u32, height as u32));
@@ -448,7 +477,13 @@ impl MathCanvasApp {
                     let g = data[source_index + 1] as u32;
                     let b = data[source_index + 2] as u32;
 
-                    packed[pixel_index] = (r << 16) | (g << 8) | b;
+                    let pixel = (r << 16) | (g << 8) | b;
+
+                    packed[pixel_index] = if self.invert_contrast {
+                        pixel ^ RGB_INVERT_MASK
+                    } else {
+                        pixel
+                    };
                 }
             }
         }
@@ -456,7 +491,15 @@ impl MathCanvasApp {
         self.add_pending_damage(rect);
     }
 
-    fn shift_packed_frame(&mut self, dx: i32, dy: i32) {
+    fn render_pan_frame(&mut self) {
+        let background = if self.invert_contrast {
+            BACKGROUND_PIXEL ^ RGB_INVERT_MASK
+        } else {
+            BACKGROUND_PIXEL
+        };
+
+        let [dx, dy] = self.pan_preview_offset;
+
         let Some(frame) = self.frame_pixmap.as_ref() else {
             return;
         };
@@ -464,50 +507,184 @@ impl MathCanvasApp {
         let width = frame.width() as usize;
         let height = frame.height() as usize;
 
-        {
-            let pixels = &mut self.packed_frame;
+        let Some(source) = self.pan_source_frame.as_ref() else {
+            return;
+        };
 
-            if pixels.len() != width * height {
-                return;
+        if source.len() != width * height {
+            return;
+        }
+
+        let Some(surface) = self.surface.as_mut() else {
+            return;
+        };
+
+        let Ok(mut buffer) = surface.buffer_mut() else {
+            return;
+        };
+
+        if buffer.len() != width * height {
+            return;
+        }
+
+        let dx = dx as i64;
+        let dy = dy as i64;
+
+        for y in 0..height {
+            let source_y = y as i64 - dy;
+
+            let row_start = y * width;
+            let destination_row = &mut buffer[row_start..row_start + width];
+
+            // This destination row has moved outside the source image.
+            if source_y < 0 || source_y >= height as i64 {
+                destination_row.fill(background);
+                continue;
             }
 
-            let shift_x = dx.unsigned_abs() as usize;
-            let shift_y = dy.unsigned_abs() as usize;
+            let source_start = source_y as usize * width;
+            let source_row = &source[source_start..source_start + width];
 
-            // A shift larger than the viewport exposes the entire background.
-            if shift_x >= width || shift_y >= height {
-                pixels.fill(BACKGROUND_PIXEL);
+            // Shift the source row horizontally using bulk memory copies.
+            if dx > 0 {
+                let shift = dx as usize;
+
+                if shift >= width {
+                    destination_row.fill(background);
+                } else {
+                    destination_row[..shift].fill(background);
+
+                    destination_row[shift..].copy_from_slice(&source_row[..width - shift]);
+                }
+            } else if dx < 0 {
+                let shift = (-dx) as usize;
+
+                if shift >= width {
+                    destination_row.fill(background);
+                } else {
+                    destination_row[..width - shift].copy_from_slice(&source_row[shift..]);
+
+                    destination_row[width - shift..].fill(background);
+                }
             } else {
-                // First shift complete rows vertically.
-                if dy > 0 {
-                    let copy_len = (height - shift_y) * width;
-
-                    pixels.copy_within(0..copy_len, shift_y * width);
-
-                    pixels[..shift_y * width].fill(BACKGROUND_PIXEL);
-                } else if dy < 0 {
-                    pixels.copy_within(shift_y * width..height * width, 0);
-
-                    pixels[(height - shift_y) * width..].fill(BACKGROUND_PIXEL);
-                }
-
-                // Then shift each row horizontally.
-                for row_index in 0..height {
-                    let start = row_index * width;
-                    let row = &mut pixels[start..start + width];
-
-                    if dx > 0 {
-                        row.copy_within(0..width - shift_x, shift_x);
-                        row[..shift_x].fill(BACKGROUND_PIXEL);
-                    } else if dx < 0 {
-                        row.copy_within(shift_x..width, 0);
-                        row[width - shift_x..].fill(BACKGROUND_PIXEL);
-                    }
-                }
+                destination_row.copy_from_slice(source_row);
             }
         }
 
-        self.add_pending_damage(PixelRect::full(width as u32, height as u32));
+        let _ = buffer.present();
+
+        // Panning changes the entire presented image.
+        // The next normal presentation must start with a full update.
+        self.damage_history.clear();
+        self.pending_damage = Some(PixelRect::full(width as u32, height as u32));
+    }
+
+    fn render_zoom_frame(&mut self) {
+        let background = if self.invert_contrast {
+            BACKGROUND_PIXEL ^ RGB_INVERT_MASK
+        } else {
+            BACKGROUND_PIXEL
+        };
+
+        let zoom = self.zoom;
+        let pan = self.pan;
+
+        let zoom_origin = self.zoom_origin;
+        let pan_origin = self.zoom_pan_origin;
+
+        let Some(source) = self.zoom_source_frame.as_ref() else {
+            return;
+        };
+
+        let Some(frame) = self.frame_pixmap.as_ref() else {
+            return;
+        };
+
+        let width = frame.width() as usize;
+        let height = frame.height() as usize;
+
+        if source.len() != width * height {
+            return;
+        }
+
+        let Some(surface) = self.surface.as_mut() else {
+            return;
+        };
+
+        let Ok(mut buffer) = surface.buffer_mut() else {
+            return;
+        };
+
+        if buffer.len() != width * height {
+            return;
+        }
+
+        // How many source pixels correspond to one destination pixel.
+        let scale = zoom_origin / zoom;
+
+        for y in 0..height {
+            // Map this destination row back into the original bitmap.
+            let source_y = ((y as f32 - pan[1]) * scale + pan_origin[1]).round() as i32;
+
+            let row_start = y * width;
+            let destination_row = &mut buffer[row_start..row_start + width];
+
+            if source_y < 0 || source_y >= height as i32 {
+                destination_row.fill(background);
+                continue;
+            }
+
+            let source_row_start = source_y as usize * width;
+
+            // Calculate the initial source X coordinate.
+            let mut source_x = (0.0 - pan[0]) * scale + pan_origin[0];
+
+            for x in 0..width {
+                let sx = source_x.round() as i32;
+
+                if sx < 0 || sx >= width as i32 {
+                    destination_row[x] = background;
+                } else {
+                    destination_row[x] = source[source_row_start + sx as usize];
+                }
+
+                // Move to the next source pixel.
+                source_x += scale;
+            }
+        }
+
+        let result = buffer.present();
+
+        if result.is_ok() {
+            // The entire visible image was updated.
+            // Record that fact for subsequent buffer-age calculations.
+            let full = PixelRect::full(width as u32, height as u32);
+
+            self.damage_history.clear();
+            self.damage_history.push_back(Some(full));
+            self.pending_damage = None;
+        }
+    }
+
+    fn finish_zoom_interaction(&mut self, event_loop: &dyn ActiveEventLoop) {
+        if !self.is_zooming {
+            return;
+        }
+
+        self.is_zooming = false;
+        self.zoom_source_frame = None;
+        self.zoom_settle_deadline = None;
+
+        self.cache_dirty = true;
+
+        // Restore the proper vector-rendered canvas before the new interaction.
+        self.ensure_committed_cache_current();
+
+        // Update the native cursor to the final brush size.
+        self.update_brush_cursor(event_loop);
+
+        self.redraw_pending = false;
+        self.next_frame_deadline = None;
     }
 
     fn schedule_interactive_redraw(&mut self, event_loop: &dyn ActiveEventLoop) {
@@ -623,6 +800,17 @@ impl MathCanvasApp {
 
         let center = (size / 2) as f32;
 
+        let color = if self.invert_contrast {
+            [
+                255 - self.current_stroke_color[0],
+                255 - self.current_stroke_color[1],
+                255 - self.current_stroke_color[2],
+                self.current_stroke_color[3],
+            ]
+        } else {
+            self.current_stroke_color
+        };
+
         // RGBA buffer. CustomCursor expects non-premultiplied alpha.
         let mut rgba = vec![0u8; size as usize * size as usize * 4];
 
@@ -639,12 +827,12 @@ impl MathCanvasApp {
                 if coverage > 0.0 {
                     let index = (y as usize * size as usize + x as usize) * 4;
 
-                    rgba[index] = self.current_stroke_color[0];
-                    rgba[index + 1] = self.current_stroke_color[1];
-                    rgba[index + 2] = self.current_stroke_color[2];
+                    rgba[index] = color[0];
+                    rgba[index + 1] = color[1];
+                    rgba[index + 2] = color[2];
 
                     rgba[index + 3] =
-                        (self.current_stroke_color[3] as f32 * coverage).round() as u8;
+                        (color[3] as f32 * coverage).round() as u8;
                 }
             }
         }
@@ -678,7 +866,7 @@ impl MathCanvasApp {
         let Some(pixmap) = self.committed_pixmap.as_mut() else {
             return;
         };
-        pixmap.fill(Color::from_rgba8(248, 249, 250, 255));
+        pixmap.fill(Color::from_rgba8(0, 0, 0, 255));
 
         let w = pixmap.width() as f32;
         let h = pixmap.height() as f32;
@@ -703,10 +891,57 @@ impl MathCanvasApp {
         // The committed pixmap now represents the current camera position.
         self.pan_origin = self.pan;
         self.pan_preview_offset = [0, 0];
-        self.pan_applied_offset = [0, 0];
+        self.pan_source_frame = None;
+    }
+
+    fn toggle_invert_contrast(&mut self, event_loop: &dyn ActiveEventLoop) {
+        self.invert_contrast = !self.invert_contrast;
+
+        // Invert the already-packed framebuffer in place.
+        for pixel in &mut self.packed_frame {
+            *pixel ^= RGB_INVERT_MASK;
+        }
+
+        // Keep temporary pan and zoom snapshots in sync.
+        if let Some(source) = self.pan_source_frame.as_mut() {
+            for pixel in source {
+                *pixel ^= RGB_INVERT_MASK;
+            }
+        }
+
+        if let Some(source) = self.zoom_source_frame.as_mut() {
+            for pixel in source {
+                *pixel ^= RGB_INVERT_MASK;
+            }
+        }
+
+        // Every pixel has changed.
+        if let Some(frame) = &self.frame_pixmap {
+            self.pending_damage = Some(PixelRect::full(frame.width(), frame.height()));
+        }
+
+        // Previous buffer damage history is no longer useful.
+        self.damage_history.clear();
+
+        // Update the native brush cursor to remain visible.
+        self.update_brush_cursor(event_loop);
+
+        // Request one redraw.
+        if let Some(win) = &self.window {
+            win.request_redraw();
+        }
     }
 
     fn render(&mut self) {
+        if self.is_panning {
+            self.render_pan_frame();
+            return;
+        }
+        if self.is_zooming {
+            self.render_zoom_frame();
+            return;
+        }
+
         let (Some(surface), Some(frame)) = (self.surface.as_mut(), self.frame_pixmap.as_ref())
         else {
             return;
@@ -819,25 +1054,77 @@ impl ApplicationHandler for MathCanvasApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
-        if self.redraw_pending {
-            let now = Instant::now();
+        let now = Instant::now();
 
-            let deadline = self.next_frame_deadline.unwrap_or(now);
+        // 1. Has the user stopped zooming?
+        let zoom_finished = self.is_zooming
+            && self
+                .zoom_settle_deadline
+                .is_some_and(|deadline| now >= deadline);
 
-            if now < deadline {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-                return;
-            }
+        if zoom_finished {
+            self.is_zooming = false;
+            self.zoom_source_frame = None;
+            self.zoom_settle_deadline = None;
 
+            // Now we need a proper vector rendering at the final zoom.
+            self.cache_dirty = true;
+
+            // Update the native cursor to match the final brush size.
+            self.update_brush_cursor(event_loop);
+
+            // Schedule the final, high-quality redraw immediately.
             self.redraw_pending = false;
-            self.next_frame_deadline = Some(now + INTERACTIVE_FRAME_INTERVAL);
+            self.next_frame_deadline = None;
 
             if let Some(win) = &self.window {
                 win.request_redraw();
             }
+
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
         }
 
-        event_loop.set_control_flow(ControlFlow::Wait);
+        // 2. Is an interactive frame ready to be presented?
+        if self.redraw_pending {
+            let deadline = self.next_frame_deadline.unwrap_or(now);
+
+            if now >= deadline {
+                self.redraw_pending = false;
+
+                self.next_frame_deadline = Some(now + INTERACTIVE_FRAME_INTERVAL);
+
+                if let Some(win) = &self.window {
+                    win.request_redraw();
+                }
+            }
+        }
+
+        // 3. Calculate when the event loop next needs to wake up.
+        let frame_deadline = if self.redraw_pending {
+            Some(self.next_frame_deadline.unwrap_or(now))
+        } else {
+            None
+        };
+
+        let zoom_deadline = if self.is_zooming {
+            self.zoom_settle_deadline
+        } else {
+            None
+        };
+
+        let next_deadline = match (frame_deadline, zoom_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+
+        if let Some(deadline) = next_deadline {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
     }
 
     fn window_event(
@@ -855,6 +1142,20 @@ impl ApplicationHandler for MathCanvasApp {
                     if let Some(surface) = self.surface.as_mut() {
                         let _ = surface.resize(w, h);
                     }
+                    // Cancel temporary zoom state; the viewport dimensions have changed.
+                    self.is_zooming = false;
+                    self.zoom_source_frame = None;
+                    self.zoom_settle_deadline = None;
+
+                    self.redraw_pending = false;
+                    self.next_frame_deadline = None;
+
+                    // Cancel temporary panning state.
+                    self.is_panning = false;
+                    self.pan_source_frame = None;
+                    self.pan_preview_offset = [0, 0];
+                    self.pan_origin = self.pan;
+
                     self.committed_pixmap = Pixmap::new(size.width, size.height);
                     self.frame_pixmap = Pixmap::new(size.width, size.height);
 
@@ -877,6 +1178,14 @@ impl ApplicationHandler for MathCanvasApp {
                 let pressed = state == ElementState::Pressed;
                 match logical_key {
                     Key::Character(ref c) if c == " " => self.space_held = pressed,
+                    Key::Character(ref c) if c.eq_ignore_ascii_case("i") => {
+                        if pressed && !self.invert_key_held {
+                            self.invert_key_held = true;
+                            self.toggle_invert_contrast(event_loop);
+                        } else if !pressed {
+                            self.invert_key_held = false;
+                        }
+                    }
                     Key::Character(ref c) if pressed && c.eq_ignore_ascii_case("z") => {
                         if self.strokes.pop().is_some() {
                             let removed_path = self.stroke_cache.paths.pop();
@@ -909,6 +1218,7 @@ impl ApplicationHandler for MathCanvasApp {
                 let is_middle_press = matches!(button, ButtonSource::Mouse(MouseButton::Middle));
                 match state {
                     ElementState::Pressed if is_primary_press && !self.space_held => {
+                        self.finish_zoom_interaction(event_loop);
                         self.ensure_committed_cache_current();
 
                         self.is_drawing = true;
@@ -955,16 +1265,20 @@ impl ApplicationHandler for MathCanvasApp {
                         }
                     }
                     ElementState::Pressed if is_middle_press || is_primary_press => {
+                        self.finish_zoom_interaction(event_loop);
                         self.ensure_committed_cache_current();
 
                         self.is_panning = true;
 
                         self.pan_origin = self.pan;
                         self.pan_preview_offset = [0, 0];
-                        self.pan_applied_offset = [0, 0];
+
+                        // Preserve the original image for the entire pan gesture.
+                        self.pan_source_frame = Some(self.packed_frame.clone());
                     }
                     ElementState::Released if self.is_panning => {
                         self.is_panning = false;
+
                         self.cache_dirty = true;
                         self.redraw_pending = false;
 
@@ -1025,37 +1339,57 @@ impl ApplicationHandler for MathCanvasApp {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if self.is_drawing {
+                // Don't change the camera during drawing or panning.
+                if self.is_drawing || self.is_panning {
                     return;
                 }
+
+                // Capture the original image only once, on the first wheel event.
+                if !self.is_zooming {
+                    self.ensure_committed_cache_current();
+
+                    self.is_zooming = true;
+
+                    self.zoom_source_frame = Some(self.packed_frame.clone());
+
+                    self.zoom_origin = self.zoom;
+                    self.zoom_pan_origin = self.pan;
+                }
+
                 let scroll_y = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y * 24.0,
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
                     _ => 0.0,
                 };
+
                 let factor = (1.0 + scroll_y * 0.002).clamp(0.5, 2.0);
+
                 let new_zoom = (self.zoom * factor).clamp(0.1, 20.0);
+
+                // Preserve the world position beneath the cursor.
                 let cx = self.cursor_screen.x as f32;
                 let cy = self.cursor_screen.y as f32;
+
                 self.pan[0] = cx - (cx - self.pan[0]) * (new_zoom / self.zoom);
                 self.pan[1] = cy - (cy - self.pan[1]) * (new_zoom / self.zoom);
 
                 self.zoom = new_zoom;
-                // Update the displayed brush cursor size.
-                self.update_brush_cursor(event_loop);
 
-                self.cache_dirty = true;
-                if let Some(win) = &self.window {
-                    win.request_redraw();
-                }
+                // Restart the settling timer after every wheel event.
+                self.zoom_settle_deadline = Some(Instant::now() + ZOOM_SETTLE_DELAY);
+
+                // Schedule a temporary preview frame.
+                self.schedule_interactive_redraw(event_loop);
             }
             WindowEvent::RedrawRequested => {
                 self.redraw_pending = false;
 
-                // 1. Rebuild if the underlying document or camera changed.
-                if self.cache_dirty {
+                // Don't rebuild the vector canvas while temporary zooming
+                // or temporary panning is active.
+                if self.cache_dirty && !self.is_zooming && !self.is_panning {
                     self.rebuild_committed_cache();
                     self.sync_frame_from_committed();
+
                     self.cache_dirty = false;
 
                     if self.is_drawing {
@@ -1063,25 +1397,12 @@ impl ApplicationHandler for MathCanvasApp {
                     }
                 }
 
-                // 2. Apply any pending bitmap movement.
-                if self.is_panning {
-                    let dx = self.pan_preview_offset[0] - self.pan_applied_offset[0];
-                    let dy = self.pan_preview_offset[1] - self.pan_applied_offset[1];
-
-                    if dx != 0 || dy != 0 {
-                        self.shift_packed_frame(dx, dy);
-                        self.pan_applied_offset = self.pan_preview_offset;
-                    }
-                }
-
-                // 3. Draw and pack any new preview geometry.
                 if self.is_drawing {
                     if let Some(damage) = self.draw_pending_preview_segments() {
                         self.update_packed_region_from_frame(damage);
                     }
                 }
 
-                // 4. Present only the required pixels.
                 self.render();
             }
             _ => {}
