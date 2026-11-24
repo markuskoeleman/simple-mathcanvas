@@ -1,4 +1,4 @@
-# A incredibly simple and fast drawing canvas I personally use for my doing maths
+# An incredibly simple drawing canvas
 
 ## keybinds
 | Keybind | Action |
