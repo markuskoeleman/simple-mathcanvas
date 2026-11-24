@@ -2,8 +2,10 @@ use serde::{Deserialize, Serialize};
 use softbuffer::{Context, Surface};
 use std::num::NonZeroU32;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 use tiny_skia::{Color, Paint, Path, PathBuilder, Pixmap, Stroke as SkiaStroke, Transform};
 use winit::application::ApplicationHandler;
+use winit::cursor::{Cursor, CustomCursorSource};
 use winit::dpi::PhysicalPosition;
 use winit::event::{
     ButtonSource, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent,
@@ -23,6 +25,9 @@ const STROKE_SIMPLIFICATION_RATIO: f32 = 0.5;
 
 const DEFAULT_STROKE_WIDTH: f32 = 2.2;
 const DEFAULT_STROKE_COLOR: [u8; 4] = [17, 24, 39, 255];
+
+// Maximum frequency for interactive canvas redraws.
+const INTERACTIVE_FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // ~60 FPS
 
 // --- Serializable Vector Data Model ---
 
@@ -245,7 +250,17 @@ struct MathCanvasApp {
     space_held: bool,
     cache_dirty: bool,
 
-    cursor_inside: bool,
+    // Drawing preview state
+    preview_points_rendered: usize,
+
+    // Interactive frame pacing
+    redraw_pending: bool,
+    next_frame_deadline: Option<Instant>,
+
+    // Temporary bitmap panning
+    pan_origin: [f32; 2],
+    pan_preview_offset: [i32; 2],
+
     current_stroke_color: [u8; 4],
     current_stroke_width: f32,
 }
@@ -268,7 +283,13 @@ impl Default for MathCanvasApp {
             space_held: false,
             cache_dirty: false,
 
-            cursor_inside: false,
+            preview_points_rendered: 0,
+
+            redraw_pending: false,
+            next_frame_deadline: None,
+
+            pan_origin: [0.0, 0.0],
+            pan_preview_offset: [0, 0],
 
             current_stroke_color: DEFAULT_STROKE_COLOR,
             current_stroke_width: DEFAULT_STROKE_WIDTH,
@@ -286,6 +307,150 @@ impl MathCanvasApp {
             (pos.x as f32 - self.pan[0]) / self.zoom,
             (pos.y as f32 - self.pan[1]) / self.zoom,
         ]
+    }
+
+    fn sync_frame_from_committed(&mut self) {
+        if let (Some(committed), Some(frame)) =
+            (self.committed_pixmap.as_ref(), self.frame_pixmap.as_mut())
+        {
+            frame.data_mut().copy_from_slice(committed.data());
+        }
+    }
+
+    fn schedule_interactive_redraw(&mut self, event_loop: &dyn ActiveEventLoop) {
+        self.redraw_pending = true;
+
+        let deadline = self.next_frame_deadline.unwrap_or_else(Instant::now);
+
+        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+    }
+
+    fn ensure_committed_cache_current(&mut self) {
+        if self.cache_dirty {
+            self.rebuild_committed_cache();
+            self.sync_frame_from_committed();
+            self.cache_dirty = false;
+        }
+    }
+
+    fn draw_pending_preview_segments(&mut self) {
+        let rendered = self.preview_points_rendered;
+        let total = self.active_points.len();
+
+        if rendered == 0 || total <= rendered {
+            return;
+        }
+
+        // Start from the last point already drawn.
+        let previous = self.active_points[rendered - 1];
+
+        let color = self.current_stroke_color;
+        let width = self.current_stroke_width;
+        let transform = self.camera_transform();
+
+        let Some(frame) = self.frame_pixmap.as_mut() else {
+            return;
+        };
+
+        let mut pb = PathBuilder::new();
+        pb.move_to(previous[0], previous[1]);
+
+        // Add every segment that has accumulated since the last frame.
+        for point in &self.active_points[rendered..] {
+            pb.line_to(point[0], point[1]);
+        }
+
+        let Some(path) = pb.finish() else {
+            return;
+        };
+
+        let mut paint = Paint::default();
+
+        paint.set_color_rgba8(color[0], color[1], color[2], color[3]);
+
+        paint.anti_alias = true;
+
+        let stroke = SkiaStroke {
+            width,
+            line_cap: tiny_skia::LineCap::Round,
+            line_join: tiny_skia::LineJoin::Round,
+            ..Default::default()
+        };
+
+        frame.stroke_path(&path, &paint, &stroke, transform, None);
+
+        // Remember how many points have now been rendered.
+        self.preview_points_rendered = total;
+    }
+
+    fn update_brush_cursor(&self, event_loop: &dyn ActiveEventLoop) {
+        // Match the displayed brush diameter.
+        let diameter = (self.current_stroke_width * self.zoom).max(1.0);
+        let radius = diameter * 0.5;
+
+        // Leave a little transparent padding around the circle.
+        let padding = 2u16;
+
+        let mut size = (diameter.ceil() as u16).saturating_add(padding * 2).max(5);
+
+        // Use an odd-sized image for an exact centre hotspot.
+        if size % 2 == 0 {
+            size += 1;
+        }
+
+        // Keep the cursor image reasonably small.
+        size = size.min(127);
+
+        let center = (size / 2) as f32;
+
+        // RGBA buffer. CustomCursor expects non-premultiplied alpha.
+        let mut rgba = vec![0u8; size as usize * size as usize * 4];
+
+        for y in 0..size {
+            for x in 0..size {
+                let dx = x as f32 - center;
+                let dy = y as f32 - center;
+
+                let distance = (dx * dx + dy * dy).sqrt();
+
+                // Simple antialiased circular edge.
+                let coverage = (radius + 0.5 - distance).clamp(0.0, 1.0);
+
+                if coverage > 0.0 {
+                    let index = (y as usize * size as usize + x as usize) * 4;
+
+                    rgba[index] = self.current_stroke_color[0];
+                    rgba[index + 1] = self.current_stroke_color[1];
+                    rgba[index + 2] = self.current_stroke_color[2];
+
+                    rgba[index + 3] =
+                        (self.current_stroke_color[3] as f32 * coverage).round() as u8;
+                }
+            }
+        }
+
+        // Create the cursor image source.
+        let source = match CustomCursorSource::from_rgba(rgba, size, size, size / 2, size / 2) {
+            Ok(source) => source,
+            Err(err) => {
+                eprintln!("Failed to create brush cursor image: {err:?}");
+                return;
+            }
+        };
+
+        // Create the platform-specific cursor.
+        let cursor = match event_loop.create_custom_cursor(source) {
+            Ok(cursor) => cursor,
+            Err(err) => {
+                eprintln!("Failed to create platform cursor: {err:?}");
+                return;
+            }
+        };
+
+        // Install the cursor.
+        if let Some(window) = &self.window {
+            window.set_cursor(Cursor::Custom(cursor));
+        }
     }
 
     fn rebuild_committed_cache(&mut self) {
@@ -315,59 +480,81 @@ impl MathCanvasApp {
 
             stroke.draw_to_pixmap(path, pixmap, transform);
         }
+        // The committed pixmap now represents the current camera position.
+        self.pan_origin = self.pan;
+        self.pan_preview_offset = [0, 0];
     }
 
     fn render(&mut self) {
-        let transform = self.camera_transform();
+        let is_panning = self.is_panning;
+        let [shift_x, shift_y] = self.pan_preview_offset;
+
         let (Some(committed), Some(frame), Some(surface)) = (
             self.committed_pixmap.as_ref(),
-            self.frame_pixmap.as_mut(),
+            self.frame_pixmap.as_ref(),
             self.surface.as_mut(),
         ) else {
             return;
         };
 
-        // 1. Blit cached background
-        frame.data_mut().copy_from_slice(committed.data());
+        // During panning, display the original cached image with an offset.
+        // Otherwise, display the normal composited frame.
+        let source = if is_panning { committed } else { frame };
 
-        // 2. Draw ghost polyline while nib is down
-        if self.active_points.len() >= 2 {
-            let mut pb = PathBuilder::new();
-            pb.move_to(self.active_points[0][0], self.active_points[0][1]);
-            for p in &self.active_points[1..] {
-                pb.line_to(p[0], p[1]);
-            }
-            if let Some(path) = pb.finish() {
-                let mut paint = Paint::default();
-                // use current active color
-                paint.set_color_rgba8(
-                    self.current_stroke_color[0],
-                    self.current_stroke_color[1],
-                    self.current_stroke_color[2],
-                    self.current_stroke_color[3],
-                );
-                paint.anti_alias = true;
+        let source_data = source.data();
+        let width = source.width() as usize;
+        let height = source.height() as usize;
 
-                let stroke = SkiaStroke {
-                    width: self.current_stroke_width,
-                    line_cap: tiny_skia::LineCap::Round,
-                    line_join: tiny_skia::LineJoin::Round,
-                    ..Default::default()
-                };
-                frame.stroke_path(&path, &paint, &stroke, transform, None);
-            }
-        }
-
-        // 4. Present to softbuffer
         let Ok(mut buffer) = surface.buffer_mut() else {
             return;
         };
-        for (dst, src) in buffer.iter_mut().zip(frame.data().chunks_exact(4)) {
-            let r = src[0] as u32;
-            let g = src[1] as u32;
-            let b = src[2] as u32;
-            *dst = (r << 16) | (g << 8) | b;
+
+        debug_assert_eq!(buffer.len(), width * height);
+
+        if !is_panning || (shift_x == 0 && shift_y == 0) {
+            // Normal presentation.
+            for (dst, src) in buffer.iter_mut().zip(source_data.chunks_exact(4)) {
+                let r = src[0] as u32;
+                let g = src[1] as u32;
+                let b = src[2] as u32;
+
+                *dst = (r << 16) | (g << 8) | b;
+            }
+        } else {
+            // Translated presentation during panning.
+            const BACKGROUND: u32 = 0x00F8F9FA;
+
+            for y in 0..height {
+                let source_y = y as i32 - shift_y;
+                let row_start = y * width;
+
+                let destination_row = &mut buffer[row_start..row_start + width];
+
+                // Entire row is outside the cached image.
+                if source_y < 0 || source_y >= height as i32 {
+                    destination_row.fill(BACKGROUND);
+                    continue;
+                }
+
+                for x in 0..width {
+                    let source_x = x as i32 - shift_x;
+
+                    if source_x < 0 || source_x >= width as i32 {
+                        destination_row[x] = BACKGROUND;
+                        continue;
+                    }
+
+                    let source_index = (source_y as usize * width + source_x as usize) * 4;
+
+                    let r = source_data[source_index] as u32;
+                    let g = source_data[source_index + 1] as u32;
+                    let b = source_data[source_index + 2] as u32;
+
+                    destination_row[x] = (r << 16) | (g << 8) | b;
+                }
+            }
         }
+
         let _ = buffer.present();
     }
 }
@@ -375,9 +562,6 @@ impl ApplicationHandler for MathCanvasApp {
     fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
         let attrs = WindowAttributes::default().with_title("Math Canvas (Tiny-Skia + Winit 0.31)");
         let window: Rc<dyn Window> = Rc::from(event_loop.create_window(attrs).unwrap());
-
-        // Hide the native cursor; we'll render our own.
-        window.set_cursor_visible(false);
 
         let context = Context::new(window.clone()).unwrap();
         let mut surface = Surface::new(&context, window.clone()).unwrap();
@@ -395,13 +579,40 @@ impl ApplicationHandler for MathCanvasApp {
         self.window = Some(window);
         self.surface = Some(surface);
 
+        // Initialise the native brush cursor.
+        self.update_brush_cursor(event_loop);
+
         // Initialise the background cache.
         self.rebuild_committed_cache();
+        self.sync_frame_from_committed();
 
         if let Some(win) = &self.window {
             win.request_redraw();
         }
     }
+
+    fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
+        if self.redraw_pending {
+            let now = Instant::now();
+
+            let deadline = self.next_frame_deadline.unwrap_or(now);
+
+            if now < deadline {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                return;
+            }
+
+            self.redraw_pending = false;
+            self.next_frame_deadline = Some(now + INTERACTIVE_FRAME_INTERVAL);
+
+            if let Some(win) = &self.window {
+                win.request_redraw();
+            }
+        }
+
+        event_loop.set_control_flow(ControlFlow::Wait);
+    }
+
     fn window_event(
         &mut self,
         event_loop: &dyn ActiveEventLoop,
@@ -468,68 +679,75 @@ impl ApplicationHandler for MathCanvasApp {
                 let is_middle_press = matches!(button, ButtonSource::Mouse(MouseButton::Middle));
                 match state {
                     ElementState::Pressed if is_primary_press && !self.space_held => {
+                        self.ensure_committed_cache_current();
+
                         self.is_drawing = true;
                         self.active_points.clear();
                         self.active_points.push(self.screen_to_world(position));
+
+                        self.preview_points_rendered = 1;
+
+                        self.sync_frame_from_committed();
+
                         if let Some(win) = &self.window {
                             win.request_redraw();
                         }
                     }
                     ElementState::Released if self.is_drawing && is_primary_press => {
                         self.is_drawing = false;
+
                         if let Some(stroke) = VectorStroke::from_raw_points(
                             &self.active_points,
                             self.current_stroke_width,
                             self.current_stroke_color,
                             (STROKE_SAMPLE_DISTANCE_PX * STROKE_SIMPLIFICATION_RATIO) / self.zoom,
                         ) {
-                            // Generate the rendering path exactly once.
                             if let Some(path) = stroke.build_render_path() {
                                 let transform = self.camera_transform();
 
-                                // Draw the new stroke into the committed canvas.
                                 if let Some(committed) = self.committed_pixmap.as_mut() {
                                     stroke.draw_to_pixmap(&path, committed, transform);
                                 }
 
-                                // Store document geometry and its corresponding rendering path.
                                 self.strokes.push(stroke);
                                 self.stroke_cache.paths.push(path);
                             }
                         }
 
+                        // Replace the temporary preview with the final committed canvas.
+                        self.sync_frame_from_committed();
+
+                        // Clear temporary stroke data.
                         self.active_points.clear();
+                        self.preview_points_rendered = 0;
+                        self.redraw_pending = false;
+
                         if let Some(win) = &self.window {
                             win.request_redraw();
                         }
                     }
                     ElementState::Pressed if is_middle_press || is_primary_press => {
+                        self.ensure_committed_cache_current();
+
                         self.is_panning = true;
+
+                        self.pan_origin = self.pan;
+                        self.pan_preview_offset = [0, 0];
                     }
                     ElementState::Released if self.is_panning => {
                         self.is_panning = false;
+
+                        // Rebuild the committed canvas at the final camera position.
+                        self.cache_dirty = true;
+
+                        // Cancel any outstanding throttled preview redraw.
+                        self.redraw_pending = false;
+
+                        if let Some(win) = &self.window {
+                            win.request_redraw();
+                        }
                     }
                     _ => {}
-                }
-            }
-            WindowEvent::PointerEntered {
-                position,
-                primary: true,
-                ..
-            } => {
-                self.cursor_screen = position;
-                self.cursor_inside = true;
-
-                if let Some(win) = &self.window {
-                    win.request_redraw();
-                }
-            }
-
-            WindowEvent::PointerLeft { primary: true, .. } => {
-                self.cursor_inside = false;
-
-                if let Some(win) = &self.window {
-                    win.request_redraw();
                 }
             }
             WindowEvent::PointerMoved {
@@ -557,6 +775,7 @@ impl ApplicationHandler for MathCanvasApp {
                     });
 
                     if should_add_point {
+                        // Store input immediately, regardless of rendering frequency.
                         self.active_points.push(world_pt);
                         needs_redraw = true;
                     }
@@ -564,15 +783,20 @@ impl ApplicationHandler for MathCanvasApp {
                     self.pan[0] += dx;
                     self.pan[1] += dy;
 
-                    self.cache_dirty = true;
-                    needs_redraw = true;
+                    // Calculate the visual displacement from the original camera position.
+                    let new_offset = [
+                        (self.pan[0] - self.pan_origin[0]).round() as i32,
+                        (self.pan[1] - self.pan_origin[1]).round() as i32,
+                    ];
+
+                    if new_offset != self.pan_preview_offset {
+                        self.pan_preview_offset = new_offset;
+                        needs_redraw = true;
+                    }
                 }
 
-                // Only redraw when the actual canvas content changes.
                 if needs_redraw {
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
-                    }
+                    self.schedule_interactive_redraw(event_loop);
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -590,16 +814,35 @@ impl ApplicationHandler for MathCanvasApp {
                 let cy = self.cursor_screen.y as f32;
                 self.pan[0] = cx - (cx - self.pan[0]) * (new_zoom / self.zoom);
                 self.pan[1] = cy - (cy - self.pan[1]) * (new_zoom / self.zoom);
+
                 self.zoom = new_zoom;
+                // Update the displayed brush cursor size.
+                self.update_brush_cursor(event_loop);
+
                 self.cache_dirty = true;
                 if let Some(win) = &self.window {
                     win.request_redraw();
                 }
             }
             WindowEvent::RedrawRequested => {
+                self.redraw_pending = false;
+
                 if self.cache_dirty {
                     self.rebuild_committed_cache();
+                    self.sync_frame_from_committed();
+
                     self.cache_dirty = false;
+
+                    // The frame was reset, so the active preview
+                    // needs to be drawn again from its first point.
+                    if self.is_drawing {
+                        self.preview_points_rendered = 1;
+                    }
+                }
+
+                // Draw any newly accumulated preview segments.
+                if self.is_drawing {
+                    self.draw_pending_preview_segments();
                 }
 
                 self.render();
