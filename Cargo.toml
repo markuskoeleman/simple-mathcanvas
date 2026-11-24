@@ -1,0 +1,10 @@
+[package]
+name = "mathcanvas"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+winit = "0.31.0-beta.4"
+tiny-skia = "0.11"
+softbuffer = "0.4"
+serde = { version = "1.0", features = ["derive"] }
