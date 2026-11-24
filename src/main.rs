@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use softbuffer::{Context, Surface};
+use softbuffer::{Context, Rect, Surface};
+use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -28,6 +29,8 @@ const DEFAULT_STROKE_COLOR: [u8; 4] = [17, 24, 39, 255];
 
 // Maximum frequency for interactive canvas redraws.
 const INTERACTIVE_FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // ~60 FPS
+
+const BACKGROUND_PIXEL: u32 = 0x00F8_F9_FA;
 
 // --- Serializable Vector Data Model ---
 
@@ -229,6 +232,66 @@ fn rdp_simplify(pts: &[[f32; 2]], epsilon: f32) -> Vec<[f32; 2]> {
     }
 }
 
+// A rectangle describing the portion of the framebuffer that changed.
+// Coordinates use exclusive maximum bounds: x1 and y1 are not included.
+#[derive(Clone, Copy, Debug)]
+struct PixelRect {
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+}
+
+impl PixelRect {
+    fn full(width: u32, height: u32) -> Self {
+        Self {
+            x0: 0,
+            y0: 0,
+            x1: width,
+            y1: height,
+        }
+    }
+
+    fn from_bounds(
+        min_x: f32,
+        min_y: f32,
+        max_x: f32,
+        max_y: f32,
+        padding: f32,
+        width: u32,
+        height: u32,
+    ) -> Option<Self> {
+        let x0 = (min_x - padding).floor().clamp(0.0, width as f32) as u32;
+        let y0 = (min_y - padding).floor().clamp(0.0, height as f32) as u32;
+        let x1 = (max_x + padding).ceil().clamp(0.0, width as f32) as u32;
+        let y1 = (max_y + padding).ceil().clamp(0.0, height as f32) as u32;
+
+        if x0 >= x1 || y0 >= y1 {
+            return None;
+        }
+
+        Some(Self { x0, y0, x1, y1 })
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            x0: self.x0.min(other.x0),
+            y0: self.y0.min(other.y0),
+            x1: self.x1.max(other.x1),
+            y1: self.y1.max(other.y1),
+        }
+    }
+
+    fn to_softbuffer_rect(self) -> Rect {
+        Rect {
+            x: self.x0,
+            y: self.y0,
+            width: NonZeroU32::new(self.x1 - self.x0).unwrap(),
+            height: NonZeroU32::new(self.y1 - self.y0).unwrap(),
+        }
+    }
+}
+
 // --- Application & Two-Stage Rendering State ---
 
 struct MathCanvasApp {
@@ -261,6 +324,18 @@ struct MathCanvasApp {
     pan_origin: [f32; 2],
     pan_preview_offset: [i32; 2],
 
+    // Packed 0x00RRGGBB framebuffer, ready for softbuffer.
+    packed_frame: Vec<u32>,
+
+    // Regions modified since the last presentation.
+    pending_damage: Option<PixelRect>,
+
+    // Damage history used to handle softbuffer's multiple buffers.
+    damage_history: VecDeque<Option<PixelRect>>,
+
+    // Offset already applied to the packed image during panning.
+    pan_applied_offset: [i32; 2],
+
     current_stroke_color: [u8; 4],
     current_stroke_width: f32,
 }
@@ -291,6 +366,11 @@ impl Default for MathCanvasApp {
             pan_origin: [0.0, 0.0],
             pan_preview_offset: [0, 0],
 
+            packed_frame: Vec::new(),
+            pending_damage: None,
+            damage_history: VecDeque::new(),
+            pan_applied_offset: [0, 0],
+
             current_stroke_color: DEFAULT_STROKE_COLOR,
             current_stroke_width: DEFAULT_STROKE_WIDTH,
         }
@@ -315,6 +395,119 @@ impl MathCanvasApp {
         {
             frame.data_mut().copy_from_slice(committed.data());
         }
+
+        self.repack_frame_full();
+    }
+
+    fn repack_frame_full(&mut self) {
+        let Some(frame) = self.frame_pixmap.as_ref() else {
+            return;
+        };
+
+        let width = frame.width() as usize;
+        let height = frame.height() as usize;
+        let data = frame.data();
+
+        self.packed_frame.resize(width * height, 0);
+
+        for (dst, src) in self.packed_frame.iter_mut().zip(data.chunks_exact(4)) {
+            let r = src[0] as u32;
+            let g = src[1] as u32;
+            let b = src[2] as u32;
+
+            *dst = (r << 16) | (g << 8) | b;
+        }
+
+        self.pending_damage = Some(PixelRect::full(width as u32, height as u32));
+    }
+
+    fn add_pending_damage(&mut self, rect: PixelRect) {
+        self.pending_damage = Some(
+            self.pending_damage
+                .map_or(rect, |existing| existing.union(rect)),
+        );
+    }
+
+    fn update_packed_region_from_frame(&mut self, rect: PixelRect) {
+        let Some(frame) = self.frame_pixmap.as_ref() else {
+            return;
+        };
+
+        let width = frame.width() as usize;
+        let data = frame.data();
+
+        {
+            let packed = &mut self.packed_frame;
+
+            for y in rect.y0..rect.y1 {
+                for x in rect.x0..rect.x1 {
+                    let pixel_index = y as usize * width + x as usize;
+                    let source_index = pixel_index * 4;
+
+                    let r = data[source_index] as u32;
+                    let g = data[source_index + 1] as u32;
+                    let b = data[source_index + 2] as u32;
+
+                    packed[pixel_index] = (r << 16) | (g << 8) | b;
+                }
+            }
+        }
+
+        self.add_pending_damage(rect);
+    }
+
+    fn shift_packed_frame(&mut self, dx: i32, dy: i32) {
+        let Some(frame) = self.frame_pixmap.as_ref() else {
+            return;
+        };
+
+        let width = frame.width() as usize;
+        let height = frame.height() as usize;
+
+        {
+            let pixels = &mut self.packed_frame;
+
+            if pixels.len() != width * height {
+                return;
+            }
+
+            let shift_x = dx.unsigned_abs() as usize;
+            let shift_y = dy.unsigned_abs() as usize;
+
+            // A shift larger than the viewport exposes the entire background.
+            if shift_x >= width || shift_y >= height {
+                pixels.fill(BACKGROUND_PIXEL);
+            } else {
+                // First shift complete rows vertically.
+                if dy > 0 {
+                    let copy_len = (height - shift_y) * width;
+
+                    pixels.copy_within(0..copy_len, shift_y * width);
+
+                    pixels[..shift_y * width].fill(BACKGROUND_PIXEL);
+                } else if dy < 0 {
+                    pixels.copy_within(shift_y * width..height * width, 0);
+
+                    pixels[(height - shift_y) * width..].fill(BACKGROUND_PIXEL);
+                }
+
+                // Then shift each row horizontally.
+                for row_index in 0..height {
+                    let start = row_index * width;
+                    let row = &mut pixels[start..start + width];
+
+                    if dx > 0 {
+                        row.copy_within(0..width - shift_x, shift_x);
+                        row[..shift_x].fill(BACKGROUND_PIXEL);
+                    } else if dx < 0 {
+                        row.copy_within(shift_x..width, 0);
+                        row[width - shift_x..].fill(BACKGROUND_PIXEL);
+                    }
+                }
+            }
+        }
+
+        self.add_pending_damage(PixelRect::full(width as u32, height as u32));
     }
 
     fn schedule_interactive_redraw(&mut self, event_loop: &dyn ActiveEventLoop) {
@@ -333,23 +526,48 @@ impl MathCanvasApp {
         }
     }
 
-    fn draw_pending_preview_segments(&mut self) {
+    fn draw_pending_preview_segments(&mut self) -> Option<PixelRect> {
         let rendered = self.preview_points_rendered;
         let total = self.active_points.len();
 
         if rendered == 0 || total <= rendered {
-            return;
+            return None;
         }
 
         // Start from the last point already drawn.
         let previous = self.active_points[rendered - 1];
+
+        // Calculate the screen-space bounds of the new preview segments.
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+
+        for point in &self.active_points[rendered - 1..] {
+            let screen_x = point[0] * self.zoom + self.pan[0];
+            let screen_y = point[1] * self.zoom + self.pan[1];
+
+            min_x = min_x.min(screen_x);
+            min_y = min_y.min(screen_y);
+            max_x = max_x.max(screen_x);
+            max_y = max_y.max(screen_y);
+        }
+
+        let (width, height) = {
+            let frame = self.frame_pixmap.as_ref()?;
+            (frame.width(), frame.height())
+        };
+
+        let padding = self.current_stroke_width * self.zoom * 0.5 + 2.0;
+
+        let damage = PixelRect::from_bounds(min_x, min_y, max_x, max_y, padding, width, height)?;
 
         let color = self.current_stroke_color;
         let width = self.current_stroke_width;
         let transform = self.camera_transform();
 
         let Some(frame) = self.frame_pixmap.as_mut() else {
-            return;
+            return None;
         };
 
         let mut pb = PathBuilder::new();
@@ -361,7 +579,7 @@ impl MathCanvasApp {
         }
 
         let Some(path) = pb.finish() else {
-            return;
+            return None;
         };
 
         let mut paint = Paint::default();
@@ -381,6 +599,8 @@ impl MathCanvasApp {
 
         // Remember how many points have now been rendered.
         self.preview_points_rendered = total;
+
+        Some(damage)
     }
 
     fn update_brush_cursor(&self, event_loop: &dyn ActiveEventLoop) {
@@ -483,27 +703,17 @@ impl MathCanvasApp {
         // The committed pixmap now represents the current camera position.
         self.pan_origin = self.pan;
         self.pan_preview_offset = [0, 0];
+        self.pan_applied_offset = [0, 0];
     }
 
     fn render(&mut self) {
-        let is_panning = self.is_panning;
-        let [shift_x, shift_y] = self.pan_preview_offset;
-
-        let (Some(committed), Some(frame), Some(surface)) = (
-            self.committed_pixmap.as_ref(),
-            self.frame_pixmap.as_ref(),
-            self.surface.as_mut(),
-        ) else {
+        let (Some(surface), Some(frame)) = (self.surface.as_mut(), self.frame_pixmap.as_ref())
+        else {
             return;
         };
 
-        // During panning, display the original cached image with an offset.
-        // Otherwise, display the normal composited frame.
-        let source = if is_panning { committed } else { frame };
-
-        let source_data = source.data();
-        let width = source.width() as usize;
-        let height = source.height() as usize;
+        let width = frame.width() as usize;
+        let height = frame.height() as usize;
 
         let Ok(mut buffer) = surface.buffer_mut() else {
             return;
@@ -511,51 +721,68 @@ impl MathCanvasApp {
 
         debug_assert_eq!(buffer.len(), width * height);
 
-        if !is_panning || (shift_x == 0 && shift_y == 0) {
-            // Normal presentation.
-            for (dst, src) in buffer.iter_mut().zip(source_data.chunks_exact(4)) {
-                let r = src[0] as u32;
-                let g = src[1] as u32;
-                let b = src[2] as u32;
+        // Determine how old this presentation buffer is.
+        let age = buffer.age() as usize;
 
-                *dst = (r << 16) | (g << 8) | b;
-            }
+        let full_rect = PixelRect::full(width as u32, height as u32);
+
+        let previous_frames_needed = age.saturating_sub(1);
+
+        // If the buffer has never been presented, or we don't have
+        // enough damage history, we must refresh the entire buffer.
+        let needs_full_copy = age == 0 || previous_frames_needed > self.damage_history.len();
+
+        let mut update_rect = if needs_full_copy {
+            Some(full_rect)
         } else {
-            // Translated presentation during panning.
-            const BACKGROUND: u32 = 0x00F8F9FA;
+            self.pending_damage
+        };
 
-            for y in 0..height {
-                let source_y = y as i32 - shift_y;
-                let row_start = y * width;
-
-                let destination_row = &mut buffer[row_start..row_start + width];
-
-                // Entire row is outside the cached image.
-                if source_y < 0 || source_y >= height as i32 {
-                    destination_row.fill(BACKGROUND);
-                    continue;
-                }
-
-                for x in 0..width {
-                    let source_x = x as i32 - shift_x;
-
-                    if source_x < 0 || source_x >= width as i32 {
-                        destination_row[x] = BACKGROUND;
-                        continue;
-                    }
-
-                    let source_index = (source_y as usize * width + source_x as usize) * 4;
-
-                    let r = source_data[source_index] as u32;
-                    let g = source_data[source_index + 1] as u32;
-                    let b = source_data[source_index + 2] as u32;
-
-                    destination_row[x] = (r << 16) | (g << 8) | b;
-                }
+        // Include changes made since this buffer was last presented.
+        if !needs_full_copy {
+            for previous_damage in self
+                .damage_history
+                .iter()
+                .rev()
+                .take(previous_frames_needed)
+                .flatten()
+            {
+                update_rect = Some(
+                    update_rect.map_or(*previous_damage, |current| current.union(*previous_damage)),
+                );
             }
         }
 
-        let _ = buffer.present();
+        // Nothing changed, and this buffer already contains the latest frame.
+        let Some(rect) = update_rect else {
+            return;
+        };
+
+        // Copy only the required rows from our packed framebuffer.
+        for y in rect.y0..rect.y1 {
+            let start = y as usize * width + rect.x0 as usize;
+            let end = y as usize * width + rect.x1 as usize;
+
+            buffer[start..end].copy_from_slice(&self.packed_frame[start..end]);
+        }
+
+        let damage = rect.to_softbuffer_rect();
+        let current_damage = self.pending_damage;
+
+        // Let the backend know which region changed.
+        let result = buffer.present_with_damage(&[damage]);
+
+        if result.is_ok() {
+            // Store the actual scene changes from this frame.
+            self.damage_history.push_back(current_damage);
+
+            // Buffer ages are normally small. Keep a little extra history.
+            if self.damage_history.len() > 8 {
+                self.damage_history.pop_front();
+            }
+
+            self.pending_damage = None;
+        }
     }
 }
 impl ApplicationHandler for MathCanvasApp {
@@ -631,6 +858,9 @@ impl ApplicationHandler for MathCanvasApp {
                     self.committed_pixmap = Pixmap::new(size.width, size.height);
                     self.frame_pixmap = Pixmap::new(size.width, size.height);
 
+                    self.damage_history.clear();
+                    self.pending_damage = None;
+
                     self.cache_dirty = true;
 
                     if let Some(win) = &self.window {
@@ -687,8 +917,6 @@ impl ApplicationHandler for MathCanvasApp {
 
                         self.preview_points_rendered = 1;
 
-                        self.sync_frame_from_committed();
-
                         if let Some(win) = &self.window {
                             win.request_redraw();
                         }
@@ -733,14 +961,11 @@ impl ApplicationHandler for MathCanvasApp {
 
                         self.pan_origin = self.pan;
                         self.pan_preview_offset = [0, 0];
+                        self.pan_applied_offset = [0, 0];
                     }
                     ElementState::Released if self.is_panning => {
                         self.is_panning = false;
-
-                        // Rebuild the committed canvas at the final camera position.
                         self.cache_dirty = true;
-
-                        // Cancel any outstanding throttled preview redraw.
                         self.redraw_pending = false;
 
                         if let Some(win) = &self.window {
@@ -827,24 +1052,36 @@ impl ApplicationHandler for MathCanvasApp {
             WindowEvent::RedrawRequested => {
                 self.redraw_pending = false;
 
+                // 1. Rebuild if the underlying document or camera changed.
                 if self.cache_dirty {
                     self.rebuild_committed_cache();
                     self.sync_frame_from_committed();
-
                     self.cache_dirty = false;
 
-                    // The frame was reset, so the active preview
-                    // needs to be drawn again from its first point.
                     if self.is_drawing {
                         self.preview_points_rendered = 1;
                     }
                 }
 
-                // Draw any newly accumulated preview segments.
-                if self.is_drawing {
-                    self.draw_pending_preview_segments();
+                // 2. Apply any pending bitmap movement.
+                if self.is_panning {
+                    let dx = self.pan_preview_offset[0] - self.pan_applied_offset[0];
+                    let dy = self.pan_preview_offset[1] - self.pan_applied_offset[1];
+
+                    if dx != 0 || dy != 0 {
+                        self.shift_packed_frame(dx, dy);
+                        self.pan_applied_offset = self.pan_preview_offset;
+                    }
                 }
 
+                // 3. Draw and pack any new preview geometry.
+                if self.is_drawing {
+                    if let Some(damage) = self.draw_pending_preview_segments() {
+                        self.update_packed_region_from_frame(damage);
+                    }
+                }
+
+                // 4. Present only the required pixels.
                 self.render();
             }
             _ => {}
