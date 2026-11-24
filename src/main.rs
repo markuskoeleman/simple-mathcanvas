@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use softbuffer::{Context, Surface};
 use std::num::NonZeroU32;
 use std::rc::Rc;
-use tiny_skia::{Color, Paint, PathBuilder, Pixmap, Stroke as SkiaStroke, Transform};
+use tiny_skia::{Color, Paint, Path, PathBuilder, Pixmap, Stroke as SkiaStroke, Transform};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::event::{
@@ -20,6 +20,9 @@ use winit::window::{Window, WindowAttributes, WindowId};
 // the current zoom level.
 const STROKE_SAMPLE_DISTANCE_PX: f32 = 2.0;
 const STROKE_SIMPLIFICATION_RATIO: f32 = 0.5;
+
+const DEFAULT_STROKE_WIDTH: f32 = 2.2;
+const DEFAULT_STROKE_COLOR: [u8; 4] = [17, 24, 39, 255];
 
 // --- Serializable Vector Data Model ---
 
@@ -134,9 +137,11 @@ impl VectorStroke {
         })
     }
 
-    fn draw_to_pixmap(&self, pixmap: &mut Pixmap, transform: Transform) {
+    fn build_render_path(&self) -> Option<Path> {
         let mut pb = PathBuilder::new();
+
         pb.move_to(self.start[0], self.start[1]);
+
         for seg in &self.segments {
             pb.cubic_to(
                 seg.ctrl1[0],
@@ -147,10 +152,15 @@ impl VectorStroke {
                 seg.end[1],
             );
         }
-        let Some(path) = pb.finish() else { return };
 
+        pb.finish()
+    }
+
+    fn draw_to_pixmap(&self, path: &Path, pixmap: &mut Pixmap, transform: Transform) {
         let mut paint = Paint::default();
+
         paint.set_color_rgba8(self.color[0], self.color[1], self.color[2], self.color[3]);
+
         paint.anti_alias = true;
 
         let stroke = SkiaStroke {
@@ -160,8 +170,19 @@ impl VectorStroke {
             ..Default::default()
         };
 
-        pixmap.stroke_path(&path, &paint, &stroke, transform, None);
+        pixmap.stroke_path(path, &paint, &stroke, transform, None);
     }
+}
+
+// --- Runtime Rendering Cache ---
+//
+// Stores generated tiny-skia paths separately from the document geometry.
+// Paths are generated once when strokes are committed and reused during
+// subsequent cache rebuilds. This data is temporary and never serialized.
+
+#[derive(Default)]
+struct StrokeRenderCache {
+    paths: Vec<Path>,
 }
 
 fn rdp_simplify(pts: &[[f32; 2]], epsilon: f32) -> Vec<[f32; 2]> {
@@ -213,6 +234,7 @@ struct MathCanvasApp {
     frame_pixmap: Option<Pixmap>,
 
     strokes: Vec<VectorStroke>,
+    stroke_cache: StrokeRenderCache,
     active_points: Vec<[f32; 2]>,
     pan: [f32; 2],
     zoom: f32,
@@ -222,6 +244,10 @@ struct MathCanvasApp {
     is_panning: bool,
     space_held: bool,
     cache_dirty: bool,
+
+    cursor_inside: bool,
+    current_stroke_color: [u8; 4],
+    current_stroke_width: f32,
 }
 
 impl Default for MathCanvasApp {
@@ -232,6 +258,7 @@ impl Default for MathCanvasApp {
             committed_pixmap: None,
             frame_pixmap: None,
             strokes: Vec::new(),
+            stroke_cache: StrokeRenderCache::default(),
             active_points: Vec::new(),
             pan: [0.0, 0.0],
             zoom: 1.0,
@@ -240,6 +267,11 @@ impl Default for MathCanvasApp {
             is_panning: false,
             space_held: false,
             cache_dirty: false,
+
+            cursor_inside: false,
+
+            current_stroke_color: DEFAULT_STROKE_COLOR,
+            current_stroke_width: DEFAULT_STROKE_WIDTH,
         }
     }
 }
@@ -270,7 +302,9 @@ impl MathCanvasApp {
         let view_max_x = (w - self.pan[0]) / self.zoom;
         let view_max_y = (h - self.pan[1]) / self.zoom;
 
-        for stroke in &self.strokes {
+        debug_assert_eq!(self.strokes.len(), self.stroke_cache.paths.len(),);
+
+        for (stroke, path) in self.strokes.iter().zip(&self.stroke_cache.paths) {
             if stroke.bounds[2] < view_min_x
                 || stroke.bounds[0] > view_max_x
                 || stroke.bounds[3] < view_min_y
@@ -278,7 +312,8 @@ impl MathCanvasApp {
             {
                 continue;
             }
-            stroke.draw_to_pixmap(pixmap, transform);
+
+            stroke.draw_to_pixmap(path, pixmap, transform);
         }
     }
 
@@ -304,11 +339,17 @@ impl MathCanvasApp {
             }
             if let Some(path) = pb.finish() {
                 let mut paint = Paint::default();
-                paint.set_color_rgba8(30, 64, 175, 190);
+                // use current active color
+                paint.set_color_rgba8(
+                    self.current_stroke_color[0],
+                    self.current_stroke_color[1],
+                    self.current_stroke_color[2],
+                    self.current_stroke_color[3],
+                );
                 paint.anti_alias = true;
 
                 let stroke = SkiaStroke {
-                    width: 2.2,
+                    width: self.current_stroke_width,
                     line_cap: tiny_skia::LineCap::Round,
                     line_join: tiny_skia::LineJoin::Round,
                     ..Default::default()
@@ -317,7 +358,38 @@ impl MathCanvasApp {
             }
         }
 
-        // 3. Present to softbuffer
+        // 3. Draw the custom brush cursor.
+        if self.cursor_inside {
+            // Match the displayed diameter of the actual stroke.
+            let radius = self.current_stroke_width * self.zoom * 0.5;
+
+            if let Some(cursor_path) = PathBuilder::from_circle(
+                self.cursor_screen.x as f32,
+                self.cursor_screen.y as f32,
+                radius,
+            ) {
+                let mut paint = Paint::default();
+
+                paint.set_color_rgba8(
+                    self.current_stroke_color[0],
+                    self.current_stroke_color[1],
+                    self.current_stroke_color[2],
+                    self.current_stroke_color[3],
+                );
+
+                paint.anti_alias = true;
+
+                frame.fill_path(
+                    &cursor_path,
+                    &paint,
+                    tiny_skia::FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
+            }
+        }
+
+        // 4. Present to softbuffer
         let Ok(mut buffer) = surface.buffer_mut() else {
             return;
         };
@@ -334,6 +406,10 @@ impl ApplicationHandler for MathCanvasApp {
     fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
         let attrs = WindowAttributes::default().with_title("Math Canvas (Tiny-Skia + Winit 0.31)");
         let window: Rc<dyn Window> = Rc::from(event_loop.create_window(attrs).unwrap());
+
+        // Hide the native cursor; we'll render our own.
+        window.set_cursor_visible(false);
+
         let context = Context::new(window.clone()).unwrap();
         let mut surface = Surface::new(&context, window.clone()).unwrap();
 
@@ -393,6 +469,9 @@ impl ApplicationHandler for MathCanvasApp {
                     Key::Character(ref c) if c == " " => self.space_held = pressed,
                     Key::Character(ref c) if pressed && c.eq_ignore_ascii_case("z") => {
                         if self.strokes.pop().is_some() {
+                            let removed_path = self.stroke_cache.paths.pop();
+                            debug_assert!(removed_path.is_some());
+
                             self.cache_dirty = true;
 
                             if let Some(win) = &self.window {
@@ -431,16 +510,25 @@ impl ApplicationHandler for MathCanvasApp {
                         self.is_drawing = false;
                         if let Some(stroke) = VectorStroke::from_raw_points(
                             &self.active_points,
-                            2.2,
-                            [17, 24, 39, 255],
+                            self.current_stroke_width,
+                            self.current_stroke_color,
                             (STROKE_SAMPLE_DISTANCE_PX * STROKE_SIMPLIFICATION_RATIO) / self.zoom,
                         ) {
-                            let transform = self.camera_transform();
-                            if let Some(committed) = self.committed_pixmap.as_mut() {
-                                stroke.draw_to_pixmap(committed, transform);
+                            // Generate the rendering path exactly once.
+                            if let Some(path) = stroke.build_render_path() {
+                                let transform = self.camera_transform();
+
+                                // Draw the new stroke into the committed canvas.
+                                if let Some(committed) = self.committed_pixmap.as_mut() {
+                                    stroke.draw_to_pixmap(&path, committed, transform);
+                                }
+
+                                // Store document geometry and its corresponding rendering path.
+                                self.strokes.push(stroke);
+                                self.stroke_cache.paths.push(path);
                             }
-                            self.strokes.push(stroke);
                         }
+
                         self.active_points.clear();
                         if let Some(win) = &self.window {
                             win.request_redraw();
@@ -455,6 +543,26 @@ impl ApplicationHandler for MathCanvasApp {
                     _ => {}
                 }
             }
+            WindowEvent::PointerEntered {
+                position,
+                primary: true,
+                ..
+            } => {
+                self.cursor_screen = position;
+                self.cursor_inside = true;
+
+                if let Some(win) = &self.window {
+                    win.request_redraw();
+                }
+            }
+
+            WindowEvent::PointerLeft { primary: true, .. } => {
+                self.cursor_inside = false;
+
+                if let Some(win) = &self.window {
+                    win.request_redraw();
+                }
+            }
             WindowEvent::PointerMoved {
                 position,
                 primary: true,
@@ -462,38 +570,34 @@ impl ApplicationHandler for MathCanvasApp {
             } => {
                 let dx = (position.x - self.cursor_screen.x) as f32;
                 let dy = (position.y - self.cursor_screen.y) as f32;
+
                 self.cursor_screen = position;
 
                 if self.is_drawing {
                     let world_pt = self.screen_to_world(position);
 
-                    if let Some(last) = self.active_points.last() {
+                    let should_add_point = self.active_points.last().map_or(true, |last| {
                         let sample_dx = (world_pt[0] - last[0]) * self.zoom;
                         let sample_dy = (world_pt[1] - last[1]) * self.zoom;
 
                         let dist_sq = sample_dx * sample_dx + sample_dy * sample_dy;
 
-                        if dist_sq < STROKE_SAMPLE_DISTANCE_PX * STROKE_SAMPLE_DISTANCE_PX {
-                            return;
-                        }
-                    }
+                        dist_sq >= STROKE_SAMPLE_DISTANCE_PX.powi(2)
+                    });
 
-                    self.active_points.push(world_pt);
-
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
+                    if should_add_point {
+                        self.active_points.push(world_pt);
                     }
                 } else if self.is_panning {
                     self.pan[0] += dx;
                     self.pan[1] += dy;
 
-                    // Tell the renderer that its cached image is outdated.
                     self.cache_dirty = true;
+                }
 
-                    // Ask winit to schedule a redraw.
-                    if let Some(win) = &self.window {
-                        win.request_redraw();
-                    }
+                // Also redraw when only the cursor has moved.
+                if let Some(win) = &self.window {
+                    win.request_redraw();
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
