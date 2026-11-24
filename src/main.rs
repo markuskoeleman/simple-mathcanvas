@@ -24,6 +24,9 @@ use winit::window::{Window, WindowAttributes, WindowId};
 const STROKE_SAMPLE_DISTANCE_PX: f32 = 2.0;
 const STROKE_SIMPLIFICATION_RATIO: f32 = 0.5;
 
+const ERASER_FLATNESS_PX: f32 = 0.75;
+const ERASER_MAX_SUBDIVISION_DEPTH: u32 = 12;
+
 const DEFAULT_STROKE_WIDTH: f32 = 2.2;
 const DEFAULT_STROKE_COLOR: [u8; 4] = [255, 255, 255, 255];
 
@@ -238,6 +241,219 @@ fn rdp_simplify(pts: &[[f32; 2]], epsilon: f32) -> Vec<[f32; 2]> {
     }
 }
 
+fn cubic_bezier_point(p0: [f32; 2], p1: [f32; 2], p2: [f32; 2], p3: [f32; 2], t: f32) -> [f32; 2] {
+    let u = 1.0 - t;
+
+    [
+        u * u * u * p0[0] + 3.0 * u * u * t * p1[0] + 3.0 * u * t * t * p2[0] + t * t * t * p3[0],
+        u * u * u * p0[1] + 3.0 * u * u * t * p1[1] + 3.0 * u * t * t * p2[1] + t * t * t * p3[1],
+    ]
+}
+
+fn point_to_segment_distance_squared(point: [f32; 2], start: [f32; 2], end: [f32; 2]) -> f32 {
+    let dx = end[0] - start[0];
+    let dy = end[1] - start[1];
+
+    let len_sq = dx * dx + dy * dy;
+
+    let t = if len_sq > 1e-6 {
+        (((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / len_sq).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    let closest_x = start[0] + t * dx;
+    let closest_y = start[1] + t * dy;
+
+    let diff_x = point[0] - closest_x;
+    let diff_y = point[1] - closest_y;
+
+    diff_x * diff_x + diff_y * diff_y
+}
+
+fn midpoint(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
+    [
+        (a[0] + b[0]) * 0.5,
+        (a[1] + b[1]) * 0.5,
+    ]
+}
+
+fn orientation(a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> f32 {
+    (b[0] - a[0]) * (c[1] - a[1])
+        - (b[1] - a[1]) * (c[0] - a[0])
+}
+
+fn segments_intersect(
+    a: [f32; 2],
+    b: [f32; 2],
+    c: [f32; 2],
+    d: [f32; 2],
+) -> bool {
+    const EPSILON: f32 = 1e-6;
+
+    let o1 = orientation(a, b, c);
+    let o2 = orientation(a, b, d);
+    let o3 = orientation(c, d, a);
+    let o4 = orientation(c, d, b);
+
+    let proper_intersection =
+        ((o1 > EPSILON && o2 < -EPSILON)
+            || (o1 < -EPSILON && o2 > EPSILON))
+        && ((o3 > EPSILON && o4 < -EPSILON)
+            || (o3 < -EPSILON && o4 > EPSILON));
+
+    if proper_intersection {
+        return true;
+    }
+
+    fn on_segment(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> bool {
+        p[0] >= a[0].min(b[0]) - 1e-6
+            && p[0] <= a[0].max(b[0]) + 1e-6
+            && p[1] >= a[1].min(b[1]) - 1e-6
+            && p[1] <= a[1].max(b[1]) + 1e-6
+    }
+
+    (o1.abs() <= EPSILON && on_segment(c, a, b))
+        || (o2.abs() <= EPSILON && on_segment(d, a, b))
+        || (o3.abs() <= EPSILON && on_segment(a, c, d))
+        || (o4.abs() <= EPSILON && on_segment(b, c, d))
+}
+
+fn segment_to_segment_distance_squared(
+    a: [f32; 2],
+    b: [f32; 2],
+    c: [f32; 2],
+    d: [f32; 2],
+) -> f32 {
+    if segments_intersect(a, b, c, d) {
+        return 0.0;
+    }
+
+    point_to_segment_distance_squared(a, c, d)
+        .min(point_to_segment_distance_squared(b, c, d))
+        .min(point_to_segment_distance_squared(c, a, b))
+        .min(point_to_segment_distance_squared(d, a, b))
+}
+
+fn cubic_touched_by_eraser(
+    p0: [f32; 2],
+    p1: [f32; 2],
+    p2: [f32; 2],
+    p3: [f32; 2],
+    eraser_from: [f32; 2],
+    eraser_to: [f32; 2],
+    hit_radius: f32,
+    flatness_tolerance: f32,
+    depth: u32,
+) -> bool {
+    // Measure how far the control points deviate from
+    // the straight line connecting the curve's endpoints.
+    let deviation_sq = point_to_segment_distance_squared(p1, p0, p3)
+        .max(point_to_segment_distance_squared(p2, p0, p3));
+
+    let deviation = deviation_sq.sqrt();
+
+    // If sufficiently flat, approximate the curve with one line.
+    if deviation <= flatness_tolerance
+        || depth >= ERASER_MAX_SUBDIVISION_DEPTH
+    {
+        // Expand the hit radius by the approximation error.
+        // This avoids missing intersections due to flattening.
+        let allowed_radius = hit_radius + deviation;
+
+        return segment_to_segment_distance_squared(
+            p0,
+            p3,
+            eraser_from,
+            eraser_to,
+        ) <= allowed_radius * allowed_radius;
+    }
+
+    // Subdivide using De Casteljau's algorithm.
+    let p01 = midpoint(p0, p1);
+    let p12 = midpoint(p1, p2);
+    let p23 = midpoint(p2, p3);
+
+    let p012 = midpoint(p01, p12);
+    let p123 = midpoint(p12, p23);
+
+    let middle = midpoint(p012, p123);
+
+    // Check the first half. Stop immediately if it intersects.
+    if cubic_touched_by_eraser(
+        p0,
+        p01,
+        p012,
+        middle,
+        eraser_from,
+        eraser_to,
+        hit_radius,
+        flatness_tolerance,
+        depth + 1,
+    ) {
+        return true;
+    }
+
+    // Otherwise check the second half.
+    cubic_touched_by_eraser(
+        middle,
+        p123,
+        p23,
+        p3,
+        eraser_from,
+        eraser_to,
+        hit_radius,
+        flatness_tolerance,
+        depth + 1,
+    )
+}
+
+fn stroke_touched_by_eraser(
+    stroke: &VectorStroke,
+    from: [f32; 2],
+    to: [f32; 2],
+    eraser_radius: f32,
+    flatness_tolerance: f32,
+) -> bool {
+    let hit_radius = eraser_radius + stroke.width * 0.5;
+
+    // Broad-phase bounding-box rejection.
+    let min_x = from[0].min(to[0]) - eraser_radius;
+    let min_y = from[1].min(to[1]) - eraser_radius;
+    let max_x = from[0].max(to[0]) + eraser_radius;
+    let max_y = from[1].max(to[1]) + eraser_radius;
+
+    if stroke.bounds[2] < min_x
+        || stroke.bounds[0] > max_x
+        || stroke.bounds[3] < min_y
+        || stroke.bounds[1] > max_y
+    {
+        return false;
+    }
+
+    let mut curve_start = stroke.start;
+
+    for segment in &stroke.segments {
+        if cubic_touched_by_eraser(
+            curve_start,
+            segment.ctrl1,
+            segment.ctrl2,
+            segment.end,
+            from,
+            to,
+            hit_radius,
+            flatness_tolerance,
+            0,
+        ) {
+            return true;
+        }
+
+        curve_start = segment.end;
+    }
+
+    false
+}
+
 // A rectangle describing the portion of the framebuffer that changed.
 // Coordinates use exclusive maximum bounds: x1 and y1 are not included.
 #[derive(Clone, Copy, Debug)]
@@ -320,6 +536,8 @@ struct MathCanvasApp {
     // inputs
     space_held: bool,
     shift_held: bool,
+    erase_held: bool,
+    is_erasing: bool,
     invert_contrast: bool,
     invert_key_held: bool,
 
@@ -375,6 +593,8 @@ impl Default for MathCanvasApp {
             is_panning: false,
             space_held: false,
             shift_held: false,
+            erase_held: false,
+            is_erasing: false,
             invert_contrast: false,
             invert_key_held: false,
             cache_dirty: false,
@@ -782,6 +1002,37 @@ impl MathCanvasApp {
         self.preview_points_rendered = total;
 
         Some(damage)
+    }
+
+    fn erase_strokes_between(
+        &mut self,
+        from_screen: PhysicalPosition<f64>,
+        to_screen: PhysicalPosition<f64>,
+    ) -> bool {
+        let from = self.screen_to_world(from_screen);
+        let to = self.screen_to_world(to_screen);
+
+        // Same world-space radius as half the normal brush width.
+        let eraser_radius = self.current_stroke_width * 0.5;
+        let flatness_tolerance = ERASER_FLATNESS_PX / self.zoom;
+
+        let mut erased_any = false;
+
+        // Iterate backwards to preserve drawing order when removing.
+        for index in (0..self.strokes.len()).rev() {
+            if stroke_touched_by_eraser(&self.strokes[index], from, to, eraser_radius, flatness_tolerance) {
+                self.strokes.remove(index);
+                self.stroke_cache.paths.remove(index);
+
+                erased_any = true;
+            }
+        }
+
+        if erased_any {
+            self.cache_dirty = true;
+        }
+
+        erased_any
     }
 
     fn update_brush_cursor(&self, event_loop: &dyn ActiveEventLoop) {
@@ -1204,6 +1455,13 @@ impl ApplicationHandler for MathCanvasApp {
                             }
                         }
                     }
+                    Key::Character(ref c) if c.eq_ignore_ascii_case("e") => {
+                        self.erase_held = pressed;
+
+                        if !pressed {
+                            self.is_erasing = false;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1223,7 +1481,23 @@ impl ApplicationHandler for MathCanvasApp {
                 );
                 let is_middle_press = matches!(button, ButtonSource::Mouse(MouseButton::Middle));
                 match state {
-                    ElementState::Pressed if is_primary_press && !self.space_held => {
+                    // PRESSED EVENTS
+                    ElementState::Pressed
+                        if is_primary_press && self.erase_held && !self.space_held =>
+                    {
+                        // erasing branch
+                        self.finish_zoom_interaction(event_loop);
+                        self.ensure_committed_cache_current();
+
+                        self.is_erasing = true;
+
+                        if self.erase_strokes_between(position, position) {
+                            self.schedule_interactive_redraw(event_loop);
+                        }
+                    }
+                    ElementState::Pressed
+                        if is_primary_press && !self.space_held && !self.erase_held =>
+                    {
                         // drawing-start branch
                         self.finish_zoom_interaction(event_loop);
                         self.ensure_committed_cache_current();
@@ -1237,6 +1511,11 @@ impl ApplicationHandler for MathCanvasApp {
                         if let Some(win) = &self.window {
                             win.request_redraw();
                         }
+                    }
+                    // RELEASE EVENTS
+                    ElementState::Released if self.is_erasing && is_primary_press => {
+                        // stop erasing
+                        self.is_erasing = false;
                     }
                     ElementState::Released if self.is_drawing && is_primary_press => {
                         // nib released, we draw the stroke
@@ -1322,6 +1601,8 @@ impl ApplicationHandler for MathCanvasApp {
                 primary: true,
                 ..
             } => {
+                let previous_position = self.cursor_screen;
+
                 let dx = (position.x - self.cursor_screen.x) as f32;
                 let dy = (position.y - self.cursor_screen.y) as f32;
 
@@ -1360,6 +1641,8 @@ impl ApplicationHandler for MathCanvasApp {
                         self.pan_preview_offset = new_offset;
                         needs_redraw = true;
                     }
+                } else if self.is_erasing {
+                    needs_redraw = self.erase_strokes_between(previous_position, position);
                 }
 
                 if needs_redraw {
@@ -1368,7 +1651,7 @@ impl ApplicationHandler for MathCanvasApp {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 // Don't change the camera during drawing or panning.
-                if self.is_drawing || self.is_panning {
+                if self.is_drawing || self.is_panning || self.is_erasing {
                     return;
                 }
 
@@ -1432,6 +1715,14 @@ impl ApplicationHandler for MathCanvasApp {
                 }
 
                 self.render();
+            }
+            WindowEvent::Focused(false) => {
+                // otherwise switching focus might cause us to miss key release event
+                self.space_held = false;
+                self.shift_held = false;
+                self.erase_held = false;
+                self.is_erasing = false;
+                self.invert_key_held = false;
             }
             // here is how we can handle autosave on close
             // WindowEvent::CloseRequested => {
