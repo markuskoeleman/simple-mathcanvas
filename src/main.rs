@@ -358,37 +358,6 @@ impl MathCanvasApp {
             }
         }
 
-        // 3. Draw the custom brush cursor.
-        if self.cursor_inside {
-            // Match the displayed diameter of the actual stroke.
-            let radius = self.current_stroke_width * self.zoom * 0.5;
-
-            if let Some(cursor_path) = PathBuilder::from_circle(
-                self.cursor_screen.x as f32,
-                self.cursor_screen.y as f32,
-                radius,
-            ) {
-                let mut paint = Paint::default();
-
-                paint.set_color_rgba8(
-                    self.current_stroke_color[0],
-                    self.current_stroke_color[1],
-                    self.current_stroke_color[2],
-                    self.current_stroke_color[3],
-                );
-
-                paint.anti_alias = true;
-
-                frame.fill_path(
-                    &cursor_path,
-                    &paint,
-                    tiny_skia::FillRule::Winding,
-                    Transform::identity(),
-                    None,
-                );
-            }
-        }
-
         // 4. Present to softbuffer
         let Ok(mut buffer) = surface.buffer_mut() else {
             return;
@@ -573,6 +542,8 @@ impl ApplicationHandler for MathCanvasApp {
 
                 self.cursor_screen = position;
 
+                let mut needs_redraw = false;
+
                 if self.is_drawing {
                     let world_pt = self.screen_to_world(position);
 
@@ -587,17 +558,21 @@ impl ApplicationHandler for MathCanvasApp {
 
                     if should_add_point {
                         self.active_points.push(world_pt);
+                        needs_redraw = true;
                     }
                 } else if self.is_panning {
                     self.pan[0] += dx;
                     self.pan[1] += dy;
 
                     self.cache_dirty = true;
+                    needs_redraw = true;
                 }
 
-                // Also redraw when only the cursor has moved.
-                if let Some(win) = &self.window {
-                    win.request_redraw();
+                // Only redraw when the actual canvas content changes.
+                if needs_redraw {
+                    if let Some(win) = &self.window {
+                        win.request_redraw();
+                    }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
