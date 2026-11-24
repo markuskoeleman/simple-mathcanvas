@@ -316,7 +316,10 @@ struct MathCanvasApp {
     cursor_screen: PhysicalPosition<f64>,
     is_drawing: bool,
     is_panning: bool,
+
+    // inputs
     space_held: bool,
+    shift_held: bool,
     invert_contrast: bool,
     invert_key_held: bool,
 
@@ -371,6 +374,7 @@ impl Default for MathCanvasApp {
             is_drawing: false,
             is_panning: false,
             space_held: false,
+            shift_held: false,
             invert_contrast: false,
             invert_key_held: false,
             cache_dirty: false,
@@ -831,8 +835,7 @@ impl MathCanvasApp {
                     rgba[index + 1] = color[1];
                     rgba[index + 2] = color[2];
 
-                    rgba[index + 3] =
-                        (color[3] as f32 * coverage).round() as u8;
+                    rgba[index + 3] = (color[3] as f32 * coverage).round() as u8;
                 }
             }
         }
@@ -1169,6 +1172,9 @@ impl ApplicationHandler for MathCanvasApp {
                     }
                 }
             }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.shift_held = modifiers.state().shift_key();
+            }
             WindowEvent::KeyboardInput {
                 event: KeyEvent {
                     logical_key, state, ..
@@ -1218,6 +1224,7 @@ impl ApplicationHandler for MathCanvasApp {
                 let is_middle_press = matches!(button, ButtonSource::Mouse(MouseButton::Middle));
                 match state {
                     ElementState::Pressed if is_primary_press && !self.space_held => {
+                        // drawing-start branch
                         self.finish_zoom_interaction(event_loop);
                         self.ensure_committed_cache_current();
 
@@ -1232,14 +1239,35 @@ impl ApplicationHandler for MathCanvasApp {
                         }
                     }
                     ElementState::Released if self.is_drawing && is_primary_press => {
+                        // nib released, we draw the stroke
                         self.is_drawing = false;
 
-                        if let Some(stroke) = VectorStroke::from_raw_points(
-                            &self.active_points,
-                            self.current_stroke_width,
-                            self.current_stroke_color,
-                            (STROKE_SAMPLE_DISTANCE_PX * STROKE_SIMPLIFICATION_RATIO) / self.zoom,
-                        ) {
+                        let epsilon =
+                            (STROKE_SAMPLE_DISTANCE_PX * STROKE_SIMPLIFICATION_RATIO) / self.zoom;
+
+                        let stroke = if self.shift_held {
+                            let start = self.active_points[0];
+                            let end = self.screen_to_world(position);
+
+                            // draw straight line between start and end
+                            VectorStroke::from_raw_points(
+                                &[start, end],
+                                self.current_stroke_width,
+                                self.current_stroke_color,
+                                epsilon,
+                            )
+                        } else {
+                            // freehand path from all points
+                            VectorStroke::from_raw_points(
+                                &self.active_points,
+                                self.current_stroke_width,
+                                self.current_stroke_color,
+                                epsilon,
+                            )
+                        };
+
+                        // commit stroke
+                        if let Some(stroke) = stroke {
                             if let Some(path) = stroke.build_render_path() {
                                 let transform = self.camera_transform();
 
