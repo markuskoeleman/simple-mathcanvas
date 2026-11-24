@@ -1433,6 +1433,9 @@ impl ApplicationHandler for MathCanvasApp {
 
                 self.render();
             }
+            // here is how we can handle autosave on close
+            // WindowEvent::CloseRequested => {
+            // }
             _ => {}
         }
     }
