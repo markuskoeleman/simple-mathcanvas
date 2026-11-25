@@ -241,15 +241,6 @@ fn rdp_simplify(pts: &[[f32; 2]], epsilon: f32) -> Vec<[f32; 2]> {
     }
 }
 
-fn cubic_bezier_point(p0: [f32; 2], p1: [f32; 2], p2: [f32; 2], p3: [f32; 2], t: f32) -> [f32; 2] {
-    let u = 1.0 - t;
-
-    [
-        u * u * u * p0[0] + 3.0 * u * u * t * p1[0] + 3.0 * u * t * t * p2[0] + t * t * t * p3[0],
-        u * u * u * p0[1] + 3.0 * u * u * t * p1[1] + 3.0 * u * t * t * p2[1] + t * t * t * p3[1],
-    ]
-}
-
 fn point_to_segment_distance_squared(point: [f32; 2], start: [f32; 2], end: [f32; 2]) -> f32 {
     let dx = end[0] - start[0];
     let dy = end[1] - start[1];
@@ -646,6 +637,91 @@ impl MathCanvasApp {
         self.repack_frame_full();
     }
 
+    // Synchronise only the pixels affected by a newly committed stroke.
+    // The rectangle is in framebuffer coordinates and uses exclusive max bounds.
+    fn sync_frame_region_from_committed(&mut self, rect: PixelRect) -> bool {
+        {
+            let (Some(committed), Some(frame)) =
+                (self.committed_pixmap.as_ref(), self.frame_pixmap.as_mut())
+            else {
+                return false;
+            };
+
+            if frame.width() != committed.width() || frame.height() != committed.height() {
+                return false;
+            }
+
+            let row_stride = committed.width() as usize * 4;
+            let x_start = rect.x0 as usize * 4;
+            let x_end = rect.x1 as usize * 4;
+            let committed_data = committed.data();
+            let frame_data = frame.data_mut();
+
+            for y in rect.y0 as usize..rect.y1 as usize {
+                let start = y * row_stride + x_start;
+                let end = y * row_stride + x_end;
+                frame_data[start..end].copy_from_slice(&committed_data[start..end]);
+            }
+        }
+
+        // Convert only the copied region to Softbuffer's packed pixel format.
+        self.update_packed_region_from_frame(rect);
+        true
+    }
+
+    // Return the screen-space area that may contain either the final Bézier
+    // stroke or its temporary polyline preview. Including both prevents stale
+    // preview pixels when the final smoothed path differs slightly from it.
+    fn stroke_commit_damage_rect(&self, stroke: &VectorStroke) -> Option<PixelRect> {
+        let frame = self.frame_pixmap.as_ref()?;
+        let zoom = self.zoom;
+        let pan = self.pan;
+
+        // VectorStroke::bounds already includes padding for the stroke width.
+        let mut damage = PixelRect::from_bounds(
+            stroke.bounds[0] * zoom + pan[0],
+            stroke.bounds[1] * zoom + pan[1],
+            stroke.bounds[2] * zoom + pan[0],
+            stroke.bounds[3] * zoom + pan[1],
+            2.0, // Additional screen-space antialiasing safety margin.
+            frame.width(),
+            frame.height(),
+        );
+
+        // The live preview is drawn from active_points, whereas the committed
+        // path is simplified and converted to Bézier curves. Union both bounds.
+        if !self.active_points.is_empty() {
+            let mut min_x = f32::MAX;
+            let mut min_y = f32::MAX;
+            let mut max_x = f32::MIN;
+            let mut max_y = f32::MIN;
+
+            for point in &self.active_points {
+                let x = point[0] * zoom + pan[0];
+                let y = point[1] * zoom + pan[1];
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+
+            let preview_padding = self.current_stroke_width * zoom * 0.5 + 2.0;
+            if let Some(preview_damage) = PixelRect::from_bounds(
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+                preview_padding,
+                frame.width(),
+                frame.height(),
+            ) {
+                damage = Some(damage.map_or(preview_damage, |rect| rect.union(preview_damage)));
+            }
+        }
+
+        damage
+    }
+
     fn repack_frame_full(&mut self) {
         let Some(frame) = self.frame_pixmap.as_ref() else {
             return;
@@ -688,27 +764,29 @@ impl MathCanvasApp {
 
         let width = frame.width() as usize;
         let data = frame.data();
+        let invert = self.invert_contrast;
+        let packed = &mut self.packed_frame;
 
-        {
-            let packed = &mut self.packed_frame;
+        // Process contiguous row slices to avoid per-pixel index arithmetic.
+        for y in rect.y0 as usize..rect.y1 as usize {
+            let pixel_start = y * width + rect.x0 as usize;
+            let pixel_end = y * width + rect.x1 as usize;
+            let source_start = pixel_start * 4;
+            let source_end = pixel_end * 4;
 
-            for y in rect.y0..rect.y1 {
-                for x in rect.x0..rect.x1 {
-                    let pixel_index = y as usize * width + x as usize;
-                    let source_index = pixel_index * 4;
+            let dst_row = &mut packed[pixel_start..pixel_end];
+            let src_row = data[source_start..source_end].chunks_exact(4);
 
-                    let r = data[source_index] as u32;
-                    let g = data[source_index + 1] as u32;
-                    let b = data[source_index + 2] as u32;
+            for (dst, src) in dst_row.iter_mut().zip(src_row) {
+                let pixel = ((src[0] as u32) << 16)
+                    | ((src[1] as u32) << 8)
+                    | (src[2] as u32);
 
-                    let pixel = (r << 16) | (g << 8) | b;
-
-                    packed[pixel_index] = if self.invert_contrast {
-                        pixel ^ RGB_INVERT_MASK
-                    } else {
-                        pixel
-                    };
-                }
+                *dst = if invert {
+                    pixel ^ RGB_INVERT_MASK
+                } else {
+                    pixel
+                };
             }
         }
 
@@ -1545,22 +1623,39 @@ impl ApplicationHandler for MathCanvasApp {
                             )
                         };
 
-                        // commit stroke
+                        // Commit the stroke to the retained vector model and CPU pixmap.
+                        let mut commit_damage = None;
+                        let mut commit_succeeded = false;
+
                         if let Some(stroke) = stroke {
                             if let Some(path) = stroke.build_render_path() {
-                                let transform = self.camera_transform();
+                                // Calculate damage before moving the stroke into the document.
+                                commit_damage = self.stroke_commit_damage_rect(&stroke);
 
+                                let transform = self.camera_transform();
                                 if let Some(committed) = self.committed_pixmap.as_mut() {
                                     stroke.draw_to_pixmap(&path, committed, transform);
                                 }
 
                                 self.strokes.push(stroke);
                                 self.stroke_cache.paths.push(path);
+                                commit_succeeded = true;
                             }
                         }
 
-                        // Replace the temporary preview with the final committed canvas.
-                        self.sync_frame_from_committed();
+                        // Replace only the temporary preview area with the final committed
+                        // pixels. A successful off-screen commit needs no framebuffer work.
+                        if commit_succeeded {
+                            if let Some(damage) = commit_damage {
+                                if !self.sync_frame_region_from_committed(damage) {
+                                    // Defensive fallback if the pixmap dimensions changed.
+                                    self.sync_frame_from_committed();
+                                }
+                            }
+                        } else {
+                            // Preserve the old recovery behaviour if path creation fails.
+                            self.sync_frame_from_committed();
+                        }
 
                         // Clear temporary stroke data.
                         self.active_points.clear();
