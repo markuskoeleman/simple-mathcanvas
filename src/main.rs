@@ -742,6 +742,39 @@ fn add_damage_rect(rects: &mut Vec<PixelRect>, mut rect: PixelRect) {
     }
 }
 
+// Gesture state is represented by one mutually-exclusive mode. Data that only
+// exists during a gesture lives in that variant, so impossible combinations
+// (for example drawing and panning simultaneously) cannot be represented.
+#[derive(Default)]
+enum Interaction {
+    #[default]
+    Idle,
+    Drawing {
+        points: Vec<[f32; 2]>,
+        rendered: usize,
+    },
+    Erasing,
+    Panning {
+        origin: [f32; 2],
+        offset: [i32; 2],
+    },
+    Zooming {
+        origin_zoom: f32,
+        origin_pan: [f32; 2],
+        settle_at: Instant,
+    },
+}
+
+// Keyboard modifiers are independent inputs, not interaction modes: Shift,
+// Space and the tool key may legitimately be held in combination.
+#[derive(Default)]
+struct HeldInputs {
+    space: bool,
+    shift: bool,
+    erase: bool,
+    invert: bool,
+}
+
 // --- Application & Two-Stage Rendering State ---
 
 struct MathCanvasApp {
@@ -757,48 +790,28 @@ struct MathCanvasApp {
     stroke_id_to_index: HashMap<u64, usize>,
     next_stroke_id: u64,
     tile_cache: TileRenderCache,
-    active_points: Vec<[f32; 2]>,
     pan: [f32; 2],
     zoom: f32,
 
     cursor_screen: PhysicalPosition<f64>,
-    is_drawing: bool,
-    is_panning: bool,
-
-    // inputs
-    space_held: bool,
-    shift_held: bool,
-    erase_held: bool,
-    is_erasing: bool,
+    interaction: Interaction,
+    inputs: HeldInputs,
     invert_contrast: bool,
-    invert_key_held: bool,
 
     cache_dirty: bool,
     // Tile invalidations expressed as a bounded list of viewport damage regions.
     pending_tile_damage: Vec<PixelRect>,
-
-    // Drawing preview state
-    preview_points_rendered: usize,
 
     // Interactive frame pacing
     redraw_pending: bool,
     event_batch_redraw_pending: bool,
     next_frame_deadline: Option<Instant>,
 
-    // Temporary bitmap panning
-    pan_origin: [f32; 2],
-    pan_preview_offset: [i32; 2],
     // Regions modified since the last presentation.
     pending_damage: Vec<PixelRect>,
 
     // Damage regions for each prior presentation, needed for softbuffer buffer ages.
     damage_history: VecDeque<Vec<PixelRect>>,
-
-    // Temporary bitmap zooming
-    is_zooming: bool,
-    zoom_origin: f32,
-    zoom_pan_origin: [f32; 2],
-    zoom_settle_deadline: Option<Instant>,
 
     current_stroke_color: [u8; 4],
     current_stroke_width: f32,
@@ -816,36 +829,21 @@ impl Default for MathCanvasApp {
             stroke_id_to_index: HashMap::new(),
             next_stroke_id: 1,
             tile_cache: TileRenderCache::default(),
-            active_points: Vec::new(),
             pan: [0.0, 0.0],
             zoom: 1.0,
             cursor_screen: PhysicalPosition::new(0.0, 0.0),
-            is_drawing: false,
-            is_panning: false,
-            space_held: false,
-            shift_held: false,
-            erase_held: false,
-            is_erasing: false,
+            interaction: Interaction::Idle,
+            inputs: HeldInputs::default(),
             invert_contrast: false,
-            invert_key_held: false,
             cache_dirty: false,
             pending_tile_damage: Vec::new(),
-
-            preview_points_rendered: 0,
 
             redraw_pending: false,
             event_batch_redraw_pending: false,
             next_frame_deadline: None,
 
-            pan_origin: [0.0, 0.0],
-            pan_preview_offset: [0, 0],
             pending_damage: Vec::new(),
             damage_history: VecDeque::new(),
-
-            is_zooming: false,
-            zoom_origin: 1.0,
-            zoom_pan_origin: [0.0, 0.0],
-            zoom_settle_deadline: None,
 
             current_stroke_color: DEFAULT_STROKE_COLOR,
             current_stroke_width: DEFAULT_STROKE_WIDTH,
@@ -880,9 +878,9 @@ impl MathCanvasApp {
         for damage in damages {
             self.composite_tiles_into_frame(damage);
         }
-        if self.is_drawing {
+        if let Interaction::Drawing { rendered, .. } = &mut self.interaction {
             // Recomposition may have overwritten parts of the live preview.
-            self.preview_points_rendered = 1;
+            *rendered = 1;
         }
     }
 
@@ -934,14 +932,18 @@ impl MathCanvasApp {
 
     // Include the temporary polyline preview as well as the final smoothed
     // Bézier path, so committing a stroke clears every preview pixel.
-    fn stroke_commit_damage_rects(&self, stroke: &VectorStroke) -> Vec<PixelRect> {
+    fn stroke_commit_damage_rects(
+        &self,
+        stroke: &VectorStroke,
+        preview_points: &[[f32; 2]],
+    ) -> Vec<PixelRect> {
         let Some(frame) = self.frame_pixmap.as_ref() else {
             return Vec::new();
         };
         let mut damages = self.stroke_damage_rects(stroke);
         let padding = self.current_stroke_width * self.zoom * 0.5 + 2.0;
 
-        for pair in self.active_points.windows(2) {
+        for pair in preview_points.windows(2) {
             let a = pair[0];
             let b = pair[1];
             if let Some(rect) = PixelRect::from_bounds(
@@ -1281,7 +1283,10 @@ impl MathCanvasApp {
     fn render_pan_frame(&mut self) {
         let invert = self.invert_contrast;
         let background = if invert { RGB_INVERT_MASK } else { 0 };
-        let [dx, dy] = self.pan_preview_offset;
+        let [dx, dy] = match &self.interaction {
+            Interaction::Panning { offset, .. } => *offset,
+            _ => return,
+        };
 
         let Some(frame) = self.frame_pixmap.as_ref() else {
             return;
@@ -1337,8 +1342,10 @@ impl MathCanvasApp {
         let background = if invert { RGB_INVERT_MASK } else { 0 };
         let zoom = self.zoom;
         let pan = self.pan;
-        let zoom_origin = self.zoom_origin;
-        let pan_origin = self.zoom_pan_origin;
+        let (zoom_origin, pan_origin) = match &self.interaction {
+            Interaction::Zooming { origin_zoom, origin_pan, .. } => (*origin_zoom, *origin_pan),
+            _ => return,
+        };
 
         let Some(frame) = self.frame_pixmap.as_ref() else {
             return;
@@ -1393,21 +1400,17 @@ impl MathCanvasApp {
     }
 
     fn finish_zoom_interaction(&mut self, event_loop: &dyn ActiveEventLoop) {
-        if !self.is_zooming {
+        let previous = std::mem::replace(&mut self.interaction, Interaction::Idle);
+        if !matches!(&previous, Interaction::Zooming { .. }) {
+            self.interaction = previous;
             return;
         }
 
-        self.is_zooming = false;
-        self.zoom_settle_deadline = None;
-
+        // This is the single zoom-finalisation path, used by the settle timer
+        // and by input that begins another interaction before the timer fires.
         self.cache_dirty = true;
-
-        // Restore the proper vector-rendered canvas before the new interaction.
         self.ensure_frame_current();
-
-        // Update the native cursor to the final brush size.
         self.update_brush_cursor(event_loop);
-
         self.redraw_pending = false;
         self.next_frame_deadline = None;
     }
@@ -1438,52 +1441,60 @@ impl MathCanvasApp {
     }
 
     fn draw_pending_preview_segments(&mut self) -> Vec<PixelRect> {
-        let rendered = self.preview_points_rendered;
-        let total = self.active_points.len();
-        if rendered == 0 || total <= rendered {
-            return Vec::new();
-        }
-
         let (frame_width, frame_height) = match self.frame_pixmap.as_ref() {
             Some(frame) => (frame.width(), frame.height()),
             None => return Vec::new(),
         };
-
-        let mut damages = Vec::with_capacity(total - rendered);
-        let padding = self.current_stroke_width * self.zoom * 0.5 + 2.0;
-        let mut previous = self.active_points[rendered - 1];
-        for &point in &self.active_points[rendered..] {
-            if let Some(rect) = PixelRect::from_bounds(
-                previous[0].min(point[0]) * self.zoom + self.pan[0],
-                previous[1].min(point[1]) * self.zoom + self.pan[1],
-                previous[0].max(point[0]) * self.zoom + self.pan[0],
-                previous[1].max(point[1]) * self.zoom + self.pan[1],
-                padding,
-                frame_width,
-                frame_height,
-            ) {
-                add_damage_rect(&mut damages, rect);
-            }
-            previous = point;
-        }
-
-        let previous = self.active_points[rendered - 1];
         let color = self.current_stroke_color;
         let width = self.current_stroke_width;
+        let padding = width * self.zoom * 0.5 + 2.0;
+        let zoom = self.zoom;
+        let pan = self.pan;
         let transform = self.camera_transform();
+
+        let (damages, path) = {
+            let Interaction::Drawing { points, rendered } = &mut self.interaction else {
+                return Vec::new();
+            };
+            let total = points.len();
+            if *rendered == 0 || total <= *rendered {
+                return Vec::new();
+            }
+
+            let first_new = *rendered;
+            let mut damages = Vec::with_capacity(total - first_new);
+            let mut previous = points[first_new - 1];
+            for &point in &points[first_new..] {
+                if let Some(rect) = PixelRect::from_bounds(
+                    previous[0].min(point[0]) * zoom + pan[0],
+                    previous[1].min(point[1]) * zoom + pan[1],
+                    previous[0].max(point[0]) * zoom + pan[0],
+                    previous[1].max(point[1]) * zoom + pan[1],
+                    padding,
+                    frame_width,
+                    frame_height,
+                ) {
+                    add_damage_rect(&mut damages, rect);
+                }
+                previous = point;
+            }
+
+            let mut pb = PathBuilder::new();
+            let previous = points[first_new - 1];
+            pb.move_to(previous[0], previous[1]);
+            for point in &points[first_new..] {
+                pb.line_to(point[0], point[1]);
+            }
+            let Some(path) = pb.finish() else {
+                return Vec::new();
+            };
+            *rendered = total;
+            (damages, path)
+        };
+
         let Some(frame) = self.frame_pixmap.as_mut() else {
             return Vec::new();
         };
-
-        let mut pb = PathBuilder::new();
-        pb.move_to(previous[0], previous[1]);
-        for point in &self.active_points[rendered..] {
-            pb.line_to(point[0], point[1]);
-        }
-        let Some(path) = pb.finish() else {
-            return Vec::new();
-        };
-
         let mut paint = Paint::default();
         paint.set_color_rgba8(color[0], color[1], color[2], color[3]);
         paint.anti_alias = true;
@@ -1494,8 +1505,6 @@ impl MathCanvasApp {
             ..Default::default()
         };
         frame.stroke_path(&path, &paint, &stroke, transform, None);
-
-        self.preview_points_rendered = total;
         damages
     }
 
@@ -1667,8 +1676,6 @@ impl MathCanvasApp {
         self.composite_tiles_into_frame(full);
 
         // The frame pixmap now represents the current camera position.
-        self.pan_origin = self.pan;
-        self.pan_preview_offset = [0, 0];
     }
 
     fn toggle_invert_contrast(&mut self, event_loop: &dyn ActiveEventLoop) {
@@ -1688,11 +1695,16 @@ impl MathCanvasApp {
     }
 
     fn render(&mut self) {
-        if self.is_panning {
+        let preview_mode = match &self.interaction {
+            Interaction::Panning { .. } => 1,
+            Interaction::Zooming { .. } => 2,
+            _ => 0,
+        };
+        if preview_mode == 1 {
             self.render_pan_frame();
             return;
         }
-        if self.is_zooming {
+        if preview_mode == 2 {
             self.render_zoom_frame();
             return;
         }
@@ -1816,8 +1828,7 @@ impl ApplicationHandler for MathCanvasApp {
     fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
         let now = Instant::now();
 
-        // Coalesce all drawing/erasing pointer events received since the last
-        // wait boundary into one redraw request. This path has no fixed timer.
+        // Coalesce drawing/erasing pointer events at the event-batch boundary.
         if self.event_batch_redraw_pending {
             self.event_batch_redraw_pending = false;
             if let Some(win) = &self.window {
@@ -1825,60 +1836,40 @@ impl ApplicationHandler for MathCanvasApp {
             }
         }
 
-        // 1. Has the user stopped zooming?
-        let zoom_finished = self.is_zooming
-            && self
-                .zoom_settle_deadline
-                .is_some_and(|deadline| now >= deadline);
-
+        // All zoom completion paths share finish_zoom_interaction().
+        let zoom_finished = matches!(
+            &self.interaction,
+            Interaction::Zooming { settle_at, .. } if now >= *settle_at
+        );
         if zoom_finished {
-            self.is_zooming = false;
-                self.zoom_settle_deadline = None;
-
-            // Now we need a proper vector rendering at the final zoom.
-            self.cache_dirty = true;
-
-            // Update the native cursor to match the final brush size.
-            self.update_brush_cursor(event_loop);
-
-            // Schedule the final, high-quality redraw immediately.
-            self.redraw_pending = false;
-            self.next_frame_deadline = None;
-
+            self.finish_zoom_interaction(event_loop);
             if let Some(win) = &self.window {
                 win.request_redraw();
             }
-
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         }
 
-        // 2. Is an interactive frame ready to be presented?
+        // Pan/zoom preview frames remain rate-limited independently of pen input.
         if self.redraw_pending {
             let deadline = self.next_frame_deadline.unwrap_or(now);
-
             if now >= deadline {
                 self.redraw_pending = false;
-
                 self.next_frame_deadline = Some(now + INTERACTIVE_FRAME_INTERVAL);
-
                 if let Some(win) = &self.window {
                     win.request_redraw();
                 }
             }
         }
 
-        // 3. Calculate when the event loop next needs to wake up.
         let frame_deadline = if self.redraw_pending {
             Some(self.next_frame_deadline.unwrap_or(now))
         } else {
             None
         };
-
-        let zoom_deadline = if self.is_zooming {
-            self.zoom_settle_deadline
-        } else {
-            None
+        let zoom_deadline = match &self.interaction {
+            Interaction::Zooming { settle_at, .. } => Some(*settle_at),
+            _ => None,
         };
 
         let next_deadline = match (frame_deadline, zoom_deadline) {
@@ -1910,18 +1901,11 @@ impl ApplicationHandler for MathCanvasApp {
                     if let Some(surface) = self.surface.as_mut() {
                         let _ = surface.resize(w, h);
                     }
-                    // Cancel temporary zoom state; the viewport dimensions have changed.
-                    self.is_zooming = false;
-                    self.zoom_settle_deadline = None;
-
+                    // The viewport changed, so cancel any gesture-local state.
+                    self.interaction = Interaction::Idle;
                     self.redraw_pending = false;
                     self.event_batch_redraw_pending = false;
                     self.next_frame_deadline = None;
-
-                    // Cancel temporary panning state.
-                    self.is_panning = false;
-                    self.pan_preview_offset = [0, 0];
-                    self.pan_origin = self.pan;
 
                     self.frame_pixmap = Pixmap::new(size.width, size.height);
 
@@ -1937,7 +1921,7 @@ impl ApplicationHandler for MathCanvasApp {
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => {
-                self.shift_held = modifiers.state().shift_key();
+                self.inputs.shift = modifiers.state().shift_key();
             }
             WindowEvent::KeyboardInput {
                 event: KeyEvent {
@@ -1947,13 +1931,13 @@ impl ApplicationHandler for MathCanvasApp {
             } => {
                 let pressed = state == ElementState::Pressed;
                 match logical_key {
-                    Key::Character(ref c) if c == " " => self.space_held = pressed,
+                    Key::Character(ref c) if c == " " => self.inputs.space = pressed,
                     Key::Character(ref c) if c.eq_ignore_ascii_case("i") => {
-                        if pressed && !self.invert_key_held {
-                            self.invert_key_held = true;
+                        if pressed && !self.inputs.invert {
+                            self.inputs.invert = true;
                             self.toggle_invert_contrast(event_loop);
                         } else if !pressed {
-                            self.invert_key_held = false;
+                            self.inputs.invert = false;
                         }
                     }
                     Key::Character(ref c) if pressed && c.eq_ignore_ascii_case("z") => {
@@ -1974,10 +1958,9 @@ impl ApplicationHandler for MathCanvasApp {
                         }
                     }
                     Key::Character(ref c) if c.eq_ignore_ascii_case("e") => {
-                        self.erase_held = pressed;
-
-                        if !pressed {
-                            self.is_erasing = false;
+                        self.inputs.erase = pressed;
+                        if !pressed && matches!(&self.interaction, Interaction::Erasing) {
+                            self.interaction = Interaction::Idle;
                         }
                     }
                     _ => {}
@@ -1999,54 +1982,69 @@ impl ApplicationHandler for MathCanvasApp {
                 );
                 let is_middle_press = matches!(button, ButtonSource::Mouse(MouseButton::Middle));
                 match state {
-                    // PRESSED EVENTS
-                    ElementState::Pressed
-                        if is_primary_press && self.erase_held && !self.space_held =>
-                    {
-                        // erasing branch
-                        self.finish_zoom_interaction(event_loop);
-                        self.ensure_frame_current();
+                    ElementState::Pressed => {
+                        let can_start_interaction = matches!(
+                            &self.interaction,
+                            Interaction::Idle | Interaction::Zooming { .. }
+                        );
 
-                        self.is_erasing = true;
-
-                        if self.erase_strokes_between(position, position) {
-                            self.schedule_event_batch_redraw();
+                        if is_primary_press
+                            && self.inputs.erase
+                            && !self.inputs.space
+                            && can_start_interaction
+                        {
+                            self.finish_zoom_interaction(event_loop);
+                            self.ensure_frame_current();
+                            self.interaction = Interaction::Erasing;
+                            if self.erase_strokes_between(position, position) {
+                                self.schedule_event_batch_redraw();
+                            }
+                        } else if is_primary_press
+                            && !self.inputs.space
+                            && !self.inputs.erase
+                            && can_start_interaction
+                        {
+                            self.finish_zoom_interaction(event_loop);
+                            self.ensure_frame_current();
+                            self.interaction = Interaction::Drawing {
+                                points: vec![self.screen_to_world(position)],
+                                rendered: 1,
+                            };
+                            if let Some(win) = &self.window {
+                                win.request_redraw();
+                            }
+                        } else if (is_middle_press || is_primary_press) && can_start_interaction {
+                            self.finish_zoom_interaction(event_loop);
+                            self.ensure_frame_current();
+                            self.interaction = Interaction::Panning {
+                                origin: self.pan,
+                                offset: [0, 0],
+                            };
                         }
                     }
-                    ElementState::Pressed
-                        if is_primary_press && !self.space_held && !self.erase_held =>
+                    ElementState::Released
+                        if is_primary_press
+                            && matches!(&self.interaction, Interaction::Erasing) =>
                     {
-                        // drawing-start branch
-                        self.finish_zoom_interaction(event_loop);
-                        self.ensure_frame_current();
-
-                        self.is_drawing = true;
-                        self.active_points.clear();
-                        self.active_points.push(self.screen_to_world(position));
-
-                        self.preview_points_rendered = 1;
-
-                        if let Some(win) = &self.window {
-                            win.request_redraw();
-                        }
+                        self.interaction = Interaction::Idle;
                     }
-                    // RELEASE EVENTS
-                    ElementState::Released if self.is_erasing && is_primary_press => {
-                        // stop erasing
-                        self.is_erasing = false;
-                    }
-                    ElementState::Released if self.is_drawing && is_primary_press => {
-                        // nib released, we draw the stroke
-                        self.is_drawing = false;
+                    ElementState::Released
+                        if is_primary_press
+                            && matches!(&self.interaction, Interaction::Drawing { .. }) =>
+                    {
+                        let Interaction::Drawing { points, .. } =
+                            std::mem::replace(&mut self.interaction, Interaction::Idle)
+                        else {
+                            unreachable!("drawing interaction changed during commit");
+                        };
 
                         let epsilon =
                             (STROKE_SAMPLE_DISTANCE_PX * STROKE_SIMPLIFICATION_RATIO) / self.zoom;
-
-                        let stroke = if self.shift_held {
-                            let start = self.active_points[0];
+                        let stroke = if self.inputs.shift {
+                            let Some(&start) = points.first() else {
+                                return;
+                            };
                             let end = self.screen_to_world(position);
-
-                            // draw straight line between start and end
                             VectorStroke::from_raw_points(
                                 &[start, end],
                                 self.current_stroke_width,
@@ -2054,23 +2052,21 @@ impl ApplicationHandler for MathCanvasApp {
                                 epsilon,
                             )
                         } else {
-                            // freehand path from all points
                             VectorStroke::from_raw_points(
-                                &self.active_points,
+                                &points,
                                 self.current_stroke_width,
                                 self.current_stroke_color,
                                 epsilon,
                             )
                         };
 
-                        // Commit the stroke to the retained vector document. Existing
-                        // rasterized tiles are updated in-place; uncached tiles stay lazy.
+                        // Append the committed path to already-rendered tiles;
+                        // uncached raster tiles remain lazy.
                         let mut commit_damage = Vec::new();
                         let mut commit_succeeded = false;
-
                         if let Some(stroke) = stroke {
                             if let Some(path) = stroke.build_render_path() {
-                                commit_damage = self.stroke_commit_damage_rects(&stroke);
+                                commit_damage = self.stroke_commit_damage_rects(&stroke, &points);
                                 let stroke_id = self.next_stroke_id;
                                 self.next_stroke_id = self.next_stroke_id.wrapping_add(1).max(1);
                                 let bounds = stroke.bounds;
@@ -2085,43 +2081,28 @@ impl ApplicationHandler for MathCanvasApp {
                             }
                         }
 
-                        // Restore the preview area from the tile renderer. This clears any
-                        // temporary polyline pixels and composites the final Bézier stroke.
+                        // Recompose the preview area from the final tile cache.
                         if commit_succeeded {
                             for damage in commit_damage {
                                 self.composite_tiles_into_frame(damage);
                             }
                         } else {
-                            // Preserve the recovery behaviour if path creation fails.
                             self.rebuild_frame_from_tiles();
                         }
 
-                        // Clear temporary stroke data.
-                        self.active_points.clear();
-                        self.preview_points_rendered = 0;
                         self.redraw_pending = false;
                         self.event_batch_redraw_pending = false;
-
                         if let Some(win) = &self.window {
                             win.request_redraw();
                         }
                     }
-                    ElementState::Pressed if is_middle_press || is_primary_press => {
-                        self.finish_zoom_interaction(event_loop);
-                        self.ensure_frame_current();
-
-                        self.is_panning = true;
-
-                        self.pan_origin = self.pan;
-                        self.pan_preview_offset = [0, 0];
-
-                    }
-                    ElementState::Released if self.is_panning => {
-                        self.is_panning = false;
-
+                    ElementState::Released
+                        if matches!(&self.interaction, Interaction::Panning { .. }) =>
+                    {
+                        self.interaction = Interaction::Idle;
                         self.cache_dirty = true;
                         self.redraw_pending = false;
-
+                        self.next_frame_deadline = None;
                         if let Some(win) = &self.window {
                             win.request_redraw();
                         }
@@ -2135,51 +2116,49 @@ impl ApplicationHandler for MathCanvasApp {
                 ..
             } => {
                 let previous_position = self.cursor_screen;
-
                 let dx = (position.x - self.cursor_screen.x) as f32;
                 let dy = (position.y - self.cursor_screen.y) as f32;
-
                 self.cursor_screen = position;
 
+                let world_point = self.screen_to_world(position);
+                let zoom = self.zoom;
                 let mut needs_event_batch_redraw = false;
                 let mut needs_throttled_redraw = false;
+                let mut should_erase = false;
 
-                if self.is_drawing {
-                    let world_pt = self.screen_to_world(position);
-
-                    let should_add_point = self.active_points.last().map_or(true, |last| {
-                        let sample_dx = (world_pt[0] - last[0]) * self.zoom;
-                        let sample_dy = (world_pt[1] - last[1]) * self.zoom;
-
-                        let dist_sq = sample_dx * sample_dx + sample_dy * sample_dy;
-
-                        dist_sq >= STROKE_SAMPLE_DISTANCE_PX.powi(2)
-                    });
-
-                    if should_add_point {
-                        // Store input immediately, regardless of rendering frequency.
-                        self.active_points.push(world_pt);
-                        needs_event_batch_redraw = true;
+                match &mut self.interaction {
+                    Interaction::Drawing { points, .. } => {
+                        let should_add_point = points.last().map_or(true, |last| {
+                            let sample_dx = (world_point[0] - last[0]) * zoom;
+                            let sample_dy = (world_point[1] - last[1]) * zoom;
+                            let distance_squared = sample_dx * sample_dx + sample_dy * sample_dy;
+                            distance_squared >= STROKE_SAMPLE_DISTANCE_PX.powi(2)
+                        });
+                        if should_add_point {
+                            points.push(world_point);
+                            needs_event_batch_redraw = true;
+                        }
                     }
-                } else if self.is_panning {
-                    self.pan[0] += dx;
-                    self.pan[1] += dy;
-
-                    // Calculate the visual displacement from the original camera position.
-                    let new_offset = [
-                        (self.pan[0] - self.pan_origin[0]).round() as i32,
-                        (self.pan[1] - self.pan_origin[1]).round() as i32,
-                    ];
-
-                    if new_offset != self.pan_preview_offset {
-                        self.pan_preview_offset = new_offset;
-                        needs_throttled_redraw = true;
+                    Interaction::Panning { origin, offset } => {
+                        self.pan[0] += dx;
+                        self.pan[1] += dy;
+                        let new_offset = [
+                            (self.pan[0] - origin[0]).round() as i32,
+                            (self.pan[1] - origin[1]).round() as i32,
+                        ];
+                        if new_offset != *offset {
+                            *offset = new_offset;
+                            needs_throttled_redraw = true;
+                        }
                     }
-                } else if self.is_erasing {
+                    Interaction::Erasing => should_erase = true,
+                    Interaction::Idle | Interaction::Zooming { .. } => {}
+                }
+
+                if should_erase {
                     needs_event_batch_redraw =
                         self.erase_strokes_between(previous_position, position);
                 }
-
                 if needs_event_batch_redraw {
                     self.schedule_event_batch_redraw();
                 }
@@ -2188,20 +2167,25 @@ impl ApplicationHandler for MathCanvasApp {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                // Don't change the camera during drawing or panning.
-                if self.is_drawing || self.is_panning || self.is_erasing {
+                // Don't change the camera during an active pen, eraser or pan gesture.
+                if matches!(
+                    &self.interaction,
+                    Interaction::Drawing { .. }
+                        | Interaction::Panning { .. }
+                        | Interaction::Erasing
+                ) {
                     return;
                 }
 
-                // Keep the original camera transform for the entire wheel gesture;
-                // preview frames sample the unchanged canonical Pixmap directly.
-                if !self.is_zooming {
+                // Keep the original canonical frame and camera transform for the
+                // whole wheel gesture; only the preview transform changes.
+                if matches!(&self.interaction, Interaction::Idle) {
                     self.ensure_frame_current();
-
-                    self.is_zooming = true;
-
-                    self.zoom_origin = self.zoom;
-                    self.zoom_pan_origin = self.pan;
+                    self.interaction = Interaction::Zooming {
+                        origin_zoom: self.zoom,
+                        origin_pan: self.pan,
+                        settle_at: Instant::now() + ZOOM_SETTLE_DELAY,
+                    };
                 }
 
                 let scroll_y = match delta {
@@ -2209,61 +2193,65 @@ impl ApplicationHandler for MathCanvasApp {
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
                     _ => 0.0,
                 };
-
                 let factor = (1.0 + scroll_y * 0.002).clamp(0.5, 2.0);
-
                 let new_zoom = (self.zoom * factor).clamp(0.1, 20.0);
 
                 // Preserve the world position beneath the cursor.
                 let cx = self.cursor_screen.x as f32;
                 let cy = self.cursor_screen.y as f32;
-
                 self.pan[0] = cx - (cx - self.pan[0]) * (new_zoom / self.zoom);
                 self.pan[1] = cy - (cy - self.pan[1]) * (new_zoom / self.zoom);
-
                 self.zoom = new_zoom;
 
-                // Restart the settling timer after every wheel event.
-                self.zoom_settle_deadline = Some(Instant::now() + ZOOM_SETTLE_DELAY);
-
-                // Schedule a temporary preview frame.
+                if let Interaction::Zooming { settle_at, .. } = &mut self.interaction {
+                    *settle_at = Instant::now() + ZOOM_SETTLE_DELAY;
+                }
                 self.schedule_interactive_redraw(event_loop);
             }
             WindowEvent::RedrawRequested => {
                 self.redraw_pending = false;
                 self.event_batch_redraw_pending = false;
 
-                // Don't rebuild the vector canvas while temporary zooming
-                // or temporary panning is active.
-                if !self.is_zooming && !self.is_panning {
+                // The canonical frame is recomposited only outside temporary
+                // pan/zoom previews. A drawing preview is replayed afterwards.
+                let camera_preview_active = matches!(
+                    &self.interaction,
+                    Interaction::Zooming { .. } | Interaction::Panning { .. }
+                );
+                if !camera_preview_active {
                     if self.cache_dirty {
                         self.rebuild_frame_from_tiles();
                         self.cache_dirty = false;
                         self.pending_tile_damage.clear();
-
-                        if self.is_drawing {
-                            self.preview_points_rendered = 1;
+                        if let Interaction::Drawing { rendered, .. } = &mut self.interaction {
+                            *rendered = 1;
                         }
                     } else {
                         self.refresh_pending_tile_damage();
                     }
                 }
 
-                if self.is_drawing {
+                if matches!(&self.interaction, Interaction::Drawing { .. }) {
                     for damage in self.draw_pending_preview_segments() {
                         self.add_pending_damage(damage);
                     }
                 }
-
                 self.render();
             }
             WindowEvent::Focused(false) => {
-                // otherwise switching focus might cause us to miss key release event
-                self.space_held = false;
-                self.shift_held = false;
-                self.erase_held = false;
-                self.is_erasing = false;
-                self.invert_key_held = false;
+                // Focus changes can suppress release events. Cancel the active
+                // gesture and rebuild to discard any temporary preview pixels.
+                self.inputs = HeldInputs::default();
+                if !matches!(&self.interaction, Interaction::Idle) {
+                    self.interaction = Interaction::Idle;
+                    self.cache_dirty = true;
+                    self.redraw_pending = false;
+                    self.event_batch_redraw_pending = false;
+                    self.next_frame_deadline = None;
+                    if let Some(win) = &self.window {
+                        win.request_redraw();
+                    }
+                }
             }
             // here is how we can handle autosave on close
             // WindowEvent::CloseRequested => {
