@@ -30,7 +30,7 @@ const ERASER_MAX_SUBDIVISION_DEPTH: u32 = 12;
 const DEFAULT_STROKE_WIDTH: f32 = 2.2;
 const DEFAULT_STROKE_COLOR: [u8; 4] = [255, 255, 255, 255];
 
-// Maximum frequency for interactive canvas redraws.
+// Maximum frequency for full-frame pan/zoom preview redraws.
 const INTERACTIVE_FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // ~60 FPS
 
 // xor colors to invert them
@@ -52,6 +52,9 @@ const TILE_BITMAP_SIZE: u32 = TILE_SIZE_PX + TILE_GUTTER_PX * 2;
 // 32px gutters on every side occupies about 1.27 MiB (RGBA8).
 const MAX_TILE_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const TILE_BITMAP_BYTES: usize = TILE_BITMAP_SIZE as usize * TILE_BITMAP_SIZE as usize * 4;
+
+// Keep disjoint damage regions separate, but bound history and per-frame work.
+const MAX_DAMAGE_RECTS: usize = 24;
 
 // --- Serializable Vector Data Model ---
 
@@ -663,6 +666,10 @@ impl PixelRect {
         }
     }
 
+    fn area(self) -> u64 {
+        (self.x1 - self.x0) as u64 * (self.y1 - self.y0) as u64
+    }
+
     fn to_softbuffer_rect(self) -> Rect {
         Rect {
             x: self.x0,
@@ -670,6 +677,68 @@ impl PixelRect {
             width: NonZeroU32::new(self.x1 - self.x0).unwrap(),
             height: NonZeroU32::new(self.y1 - self.y0).unwrap(),
         }
+    }
+}
+
+// Insert one damaged rectangle while preserving spatial locality. Strongly
+// overlapping rectangles are coalesced; distant rectangles remain independent.
+// If the list reaches its fixed bound, merge the pair with the least extra area.
+fn add_damage_rect(rects: &mut Vec<PixelRect>, mut rect: PixelRect) {
+    let mut index = 0;
+    while index < rects.len() {
+        let existing = rects[index];
+        let union = existing.union(rect);
+        let largest_area = existing.area().max(rect.area());
+
+        // Merge duplicates/containment and close overlaps, but do not let a
+        // growing diagonal bounding box absorb every later segment.
+        if union.area() <= largest_area.saturating_add(largest_area / 4) {
+            rect = union;
+            rects.swap_remove(index);
+            index = 0;
+        } else {
+            index += 1;
+        }
+    }
+    rects.push(rect);
+
+    while rects.len() > MAX_DAMAGE_RECTS {
+        let mut best_pair = (0usize, 1usize);
+        let mut best_extra_area = u64::MAX;
+
+        for i in 0..rects.len() {
+            for j in i + 1..rects.len() {
+                let a = rects[i];
+                let b = rects[j];
+                let extra_area = a.union(b).area().saturating_sub(a.area().saturating_add(b.area()));
+                if extra_area < best_extra_area {
+                    best_extra_area = extra_area;
+                    best_pair = (i, j);
+                }
+            }
+        }
+
+        let (i, j) = best_pair;
+        let merged = rects[i].union(rects[j]);
+        rects.swap_remove(j);
+        rects.swap_remove(i);
+
+        // The merged rectangle may now overlap another nearby region.
+        let mut merged = merged;
+        let mut index = 0;
+        while index < rects.len() {
+            let existing = rects[index];
+            let union = existing.union(merged);
+            let largest_area = existing.area().max(merged.area());
+            if union.area() <= largest_area.saturating_add(largest_area / 4) {
+                merged = union;
+                rects.swap_remove(index);
+                index = 0;
+            } else {
+                index += 1;
+            }
+        }
+        rects.push(merged);
     }
 }
 
@@ -705,24 +774,25 @@ struct MathCanvasApp {
     invert_key_held: bool,
 
     cache_dirty: bool,
-    // World-tile invalidations expressed as viewport damage awaiting a redraw.
-    pending_tile_damage: Option<PixelRect>,
+    // Tile invalidations expressed as a bounded list of viewport damage regions.
+    pending_tile_damage: Vec<PixelRect>,
 
     // Drawing preview state
     preview_points_rendered: usize,
 
     // Interactive frame pacing
     redraw_pending: bool,
+    event_batch_redraw_pending: bool,
     next_frame_deadline: Option<Instant>,
 
     // Temporary bitmap panning
     pan_origin: [f32; 2],
     pan_preview_offset: [i32; 2],
     // Regions modified since the last presentation.
-    pending_damage: Option<PixelRect>,
+    pending_damage: Vec<PixelRect>,
 
-    // Damage history used to handle softbuffer's multiple buffers.
-    damage_history: VecDeque<Option<PixelRect>>,
+    // Damage regions for each prior presentation, needed for softbuffer buffer ages.
+    damage_history: VecDeque<Vec<PixelRect>>,
 
     // Temporary bitmap zooming
     is_zooming: bool,
@@ -759,16 +829,17 @@ impl Default for MathCanvasApp {
             invert_contrast: false,
             invert_key_held: false,
             cache_dirty: false,
-            pending_tile_damage: None,
+            pending_tile_damage: Vec::new(),
 
             preview_points_rendered: 0,
 
             redraw_pending: false,
+            event_batch_redraw_pending: false,
             next_frame_deadline: None,
 
             pan_origin: [0.0, 0.0],
             pan_preview_offset: [0, 0],
-            pending_damage: None,
+            pending_damage: Vec::new(),
             damage_history: VecDeque::new(),
 
             is_zooming: false,
@@ -794,82 +865,98 @@ impl MathCanvasApp {
         ]
     }
 
-    fn screen_damage_for_world_bounds(&self, bounds: [f32; 4]) -> Option<PixelRect> {
-        let frame = self.frame_pixmap.as_ref()?;
-        PixelRect::from_bounds(
-            bounds[0] * self.zoom + self.pan[0],
-            bounds[1] * self.zoom + self.pan[1],
-            bounds[2] * self.zoom + self.pan[0],
-            bounds[3] * self.zoom + self.pan[1],
-            2.0,
-            frame.width(),
-            frame.height(),
-        )
-    }
-
     fn add_pending_tile_damage(&mut self, rect: PixelRect) {
-        self.pending_tile_damage = Some(
-            self.pending_tile_damage
-                .map_or(rect, |existing| existing.union(rect)),
-        );
+        add_damage_rect(&mut self.pending_tile_damage, rect);
     }
 
     fn refresh_pending_tile_damage(&mut self) {
-        if let Some(damage) = self.pending_tile_damage.take() {
-            // Tile pixels are composited straight into the display pixmap. This
-            // removes the need for a second viewport-sized committed pixmap.
+        if self.pending_tile_damage.is_empty() {
+            return;
+        }
+
+        let damages = std::mem::take(&mut self.pending_tile_damage);
+        // Recompose only the affected regions. Separate regions stay separate,
+        // which is important for long diagonal strokes and multi-stroke erases.
+        for damage in damages {
             self.composite_tiles_into_frame(damage);
-            if self.is_drawing {
-                // The damaged rectangle may have overwritten part of the live
-                // preview. Rebuild its incremental tail from the first point.
-                self.preview_points_rendered = 1;
-            }
+        }
+        if self.is_drawing {
+            // Recomposition may have overwritten parts of the live preview.
+            self.preview_points_rendered = 1;
         }
     }
 
-    // Return the screen-space area that may contain either the final Bézier
-    // stroke or its temporary polyline preview. Including both prevents stale
-    // preview pixels when the final smoothed path differs slightly from it.
-    fn stroke_commit_damage_rect(&self, stroke: &VectorStroke) -> Option<PixelRect> {
-        let frame = self.frame_pixmap.as_ref()?;
-        let zoom = self.zoom;
-        let pan = self.pan;
+    // Return compact screen-space damage rectangles for each Bézier segment.
+    // A cubic curve lies inside the convex hull of its endpoints/control points,
+    // so these bounds safely cover the rasterized stroke without using one huge
+    // page-spanning bounding box for a long diagonal.
+    fn stroke_damage_rects(&self, stroke: &VectorStroke) -> Vec<PixelRect> {
+        let Some(frame) = self.frame_pixmap.as_ref() else {
+            return Vec::new();
+        };
+        let mut damages = Vec::with_capacity(stroke.segments.len());
+        let padding = stroke.width * self.zoom * 0.5 + 2.0;
+        let mut curve_start = stroke.start;
 
-        // VectorStroke::bounds already includes padding for the stroke width.
-        let mut damage = self.screen_damage_for_world_bounds(stroke.bounds);
+        for segment in &stroke.segments {
+            let min_x = curve_start[0]
+                .min(segment.ctrl1[0])
+                .min(segment.ctrl2[0])
+                .min(segment.end[0]);
+            let min_y = curve_start[1]
+                .min(segment.ctrl1[1])
+                .min(segment.ctrl2[1])
+                .min(segment.end[1]);
+            let max_x = curve_start[0]
+                .max(segment.ctrl1[0])
+                .max(segment.ctrl2[0])
+                .max(segment.end[0]);
+            let max_y = curve_start[1]
+                .max(segment.ctrl1[1])
+                .max(segment.ctrl2[1])
+                .max(segment.end[1]);
 
-        // The live preview is drawn from active_points, whereas the committed
-        // path is simplified and converted to Bézier curves. Union both bounds.
-        if !self.active_points.is_empty() {
-            let mut min_x = f32::MAX;
-            let mut min_y = f32::MAX;
-            let mut max_x = f32::MIN;
-            let mut max_y = f32::MIN;
-
-            for point in &self.active_points {
-                let x = point[0] * zoom + pan[0];
-                let y = point[1] * zoom + pan[1];
-                min_x = min_x.min(x);
-                min_y = min_y.min(y);
-                max_x = max_x.max(x);
-                max_y = max_y.max(y);
-            }
-
-            let preview_padding = self.current_stroke_width * zoom * 0.5 + 2.0;
-            if let Some(preview_damage) = PixelRect::from_bounds(
-                min_x,
-                min_y,
-                max_x,
-                max_y,
-                preview_padding,
+            if let Some(rect) = PixelRect::from_bounds(
+                min_x * self.zoom + self.pan[0],
+                min_y * self.zoom + self.pan[1],
+                max_x * self.zoom + self.pan[0],
+                max_y * self.zoom + self.pan[1],
+                padding,
                 frame.width(),
                 frame.height(),
             ) {
-                damage = Some(damage.map_or(preview_damage, |rect| rect.union(preview_damage)));
+                add_damage_rect(&mut damages, rect);
+            }
+            curve_start = segment.end;
+        }
+        damages
+    }
+
+    // Include the temporary polyline preview as well as the final smoothed
+    // Bézier path, so committing a stroke clears every preview pixel.
+    fn stroke_commit_damage_rects(&self, stroke: &VectorStroke) -> Vec<PixelRect> {
+        let Some(frame) = self.frame_pixmap.as_ref() else {
+            return Vec::new();
+        };
+        let mut damages = self.stroke_damage_rects(stroke);
+        let padding = self.current_stroke_width * self.zoom * 0.5 + 2.0;
+
+        for pair in self.active_points.windows(2) {
+            let a = pair[0];
+            let b = pair[1];
+            if let Some(rect) = PixelRect::from_bounds(
+                a[0].min(b[0]) * self.zoom + self.pan[0],
+                a[1].min(b[1]) * self.zoom + self.pan[1],
+                a[0].max(b[0]) * self.zoom + self.pan[0],
+                a[1].max(b[1]) * self.zoom + self.pan[1],
+                padding,
+                frame.width(),
+                frame.height(),
+            ) {
+                add_damage_rect(&mut damages, rect);
             }
         }
-
-        damage
+        damages
     }
 
     fn ensure_spatial_index_current(&mut self) {
@@ -1188,10 +1275,7 @@ impl MathCanvasApp {
     }
 
     fn add_pending_damage(&mut self, rect: PixelRect) {
-        self.pending_damage = Some(
-            self.pending_damage
-                .map_or(rect, |existing| existing.union(rect)),
-        );
+        add_damage_rect(&mut self.pending_damage, rect);
     }
 
     fn render_pan_frame(&mut self) {
@@ -1244,7 +1328,8 @@ impl MathCanvasApp {
 
         let _ = buffer.present();
         self.damage_history.clear();
-        self.pending_damage = Some(PixelRect::full(width as u32, height as u32));
+        self.pending_damage.clear();
+        self.pending_damage.push(PixelRect::full(width as u32, height as u32));
     }
 
     fn render_zoom_frame(&mut self) {
@@ -1302,8 +1387,8 @@ impl MathCanvasApp {
         if result.is_ok() {
             let full = PixelRect::full(width as u32, height as u32);
             self.damage_history.clear();
-            self.damage_history.push_back(Some(full));
-            self.pending_damage = None;
+            self.damage_history.push_back(vec![full]);
+            self.pending_damage.clear();
         }
     }
 
@@ -1327,11 +1412,18 @@ impl MathCanvasApp {
         self.next_frame_deadline = None;
     }
 
+    // Drawing and erasing request one redraw after the current event batch.
+    // This avoids imposing a fixed 60 Hz timer on pen input and naturally
+    // follows the platform's event cadence (including 120/144 Hz displays).
+    fn schedule_event_batch_redraw(&mut self) {
+        self.event_batch_redraw_pending = true;
+    }
+
+    // Camera previews are intentionally throttled to avoid excessive full-frame
+    // resampling while panning or zooming.
     fn schedule_interactive_redraw(&mut self, event_loop: &dyn ActiveEventLoop) {
         self.redraw_pending = true;
-
         let deadline = self.next_frame_deadline.unwrap_or_else(Instant::now);
-
         event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
     }
 
@@ -1339,87 +1431,72 @@ impl MathCanvasApp {
         if self.cache_dirty {
             self.rebuild_frame_from_tiles();
             self.cache_dirty = false;
-            self.pending_tile_damage = None;
+            self.pending_tile_damage.clear();
         } else {
             self.refresh_pending_tile_damage();
         }
     }
 
-    fn draw_pending_preview_segments(&mut self) -> Option<PixelRect> {
+    fn draw_pending_preview_segments(&mut self) -> Vec<PixelRect> {
         let rendered = self.preview_points_rendered;
         let total = self.active_points.len();
-
         if rendered == 0 || total <= rendered {
-            return None;
+            return Vec::new();
         }
 
-        // Start from the last point already drawn.
-        let previous = self.active_points[rendered - 1];
-
-        // Calculate the screen-space bounds of the new preview segments.
-        let mut min_x = f32::MAX;
-        let mut min_y = f32::MAX;
-        let mut max_x = f32::MIN;
-        let mut max_y = f32::MIN;
-
-        for point in &self.active_points[rendered - 1..] {
-            let screen_x = point[0] * self.zoom + self.pan[0];
-            let screen_y = point[1] * self.zoom + self.pan[1];
-
-            min_x = min_x.min(screen_x);
-            min_y = min_y.min(screen_y);
-            max_x = max_x.max(screen_x);
-            max_y = max_y.max(screen_y);
-        }
-
-        let (width, height) = {
-            let frame = self.frame_pixmap.as_ref()?;
-            (frame.width(), frame.height())
+        let (frame_width, frame_height) = match self.frame_pixmap.as_ref() {
+            Some(frame) => (frame.width(), frame.height()),
+            None => return Vec::new(),
         };
 
+        let mut damages = Vec::with_capacity(total - rendered);
         let padding = self.current_stroke_width * self.zoom * 0.5 + 2.0;
+        let mut previous = self.active_points[rendered - 1];
+        for &point in &self.active_points[rendered..] {
+            if let Some(rect) = PixelRect::from_bounds(
+                previous[0].min(point[0]) * self.zoom + self.pan[0],
+                previous[1].min(point[1]) * self.zoom + self.pan[1],
+                previous[0].max(point[0]) * self.zoom + self.pan[0],
+                previous[1].max(point[1]) * self.zoom + self.pan[1],
+                padding,
+                frame_width,
+                frame_height,
+            ) {
+                add_damage_rect(&mut damages, rect);
+            }
+            previous = point;
+        }
 
-        let damage = PixelRect::from_bounds(min_x, min_y, max_x, max_y, padding, width, height)?;
-
+        let previous = self.active_points[rendered - 1];
         let color = self.current_stroke_color;
         let width = self.current_stroke_width;
         let transform = self.camera_transform();
-
         let Some(frame) = self.frame_pixmap.as_mut() else {
-            return None;
+            return Vec::new();
         };
 
         let mut pb = PathBuilder::new();
         pb.move_to(previous[0], previous[1]);
-
-        // Add every segment that has accumulated since the last frame.
         for point in &self.active_points[rendered..] {
             pb.line_to(point[0], point[1]);
         }
-
         let Some(path) = pb.finish() else {
-            return None;
+            return Vec::new();
         };
 
         let mut paint = Paint::default();
-
         paint.set_color_rgba8(color[0], color[1], color[2], color[3]);
-
         paint.anti_alias = true;
-
         let stroke = SkiaStroke {
             width,
             line_cap: tiny_skia::LineCap::Round,
             line_join: tiny_skia::LineJoin::Round,
             ..Default::default()
         };
-
         frame.stroke_path(&path, &paint, &stroke, transform, None);
 
-        // Remember how many points have now been rendered.
         self.preview_points_rendered = total;
-
-        Some(damage)
+        damages
     }
 
     fn erase_strokes_between(
@@ -1454,7 +1531,7 @@ impl MathCanvasApp {
         candidate_ids.dedup();
 
         let mut removed_ids = HashSet::new();
-        let mut damage = None;
+        let mut damages = Vec::new();
         for stroke_id in candidate_ids {
             let Some(&index) = self.stroke_id_to_index.get(&stroke_id) else {
                 continue;
@@ -1462,10 +1539,8 @@ impl MathCanvasApp {
             let stroke = &self.strokes[index];
             if stroke_touched_by_eraser(stroke, from, to, eraser_radius, flatness_tolerance) {
                 removed_ids.insert(stroke_id);
-                if let Some(stroke_damage) = self.screen_damage_for_world_bounds(stroke.bounds) {
-                    damage = Some(
-                        damage.map_or(stroke_damage, |rect: PixelRect| rect.union(stroke_damage)),
-                    );
+                for stroke_damage in self.stroke_damage_rects(stroke) {
+                    add_damage_rect(&mut damages, stroke_damage);
                 }
             }
         }
@@ -1498,7 +1573,7 @@ impl MathCanvasApp {
         }
 
         self.rebuild_stroke_id_to_index();
-        if let Some(damage) = damage {
+        for damage in damages {
             self.add_pending_tile_damage(damage);
         }
         true
@@ -1602,7 +1677,8 @@ impl MathCanvasApp {
         // The canonical pixmap remains unchanged; inversion is applied while
         // copying pixels into softbuffer. Mark the whole presentation dirty.
         if let Some(frame) = &self.frame_pixmap {
-            self.pending_damage = Some(PixelRect::full(frame.width(), frame.height()));
+            self.pending_damage.clear();
+            self.pending_damage.push(PixelRect::full(frame.width(), frame.height()));
         }
         self.damage_history.clear();
         self.update_brush_cursor(event_loop);
@@ -1639,61 +1715,69 @@ impl MathCanvasApp {
         let full_rect = PixelRect::full(width as u32, height as u32);
         let previous_frames_needed = age.saturating_sub(1);
         let needs_full_copy = age == 0 || previous_frames_needed > self.damage_history.len();
-        let mut update_rect = if needs_full_copy {
-            Some(full_rect)
+
+        let mut update_rects = if needs_full_copy {
+            vec![full_rect]
         } else {
-            self.pending_damage
+            self.pending_damage.clone()
         };
 
+        // A softbuffer buffer may be older than one frame. Reapply every
+        // intervening frame's damage, preserving disjoint regions.
         if !needs_full_copy {
             for previous_damage in self
                 .damage_history
                 .iter()
                 .rev()
                 .take(previous_frames_needed)
-                .flatten()
             {
-                update_rect = Some(
-                    update_rect.map_or(*previous_damage, |current| current.union(*previous_damage)),
-                );
+                for rect in previous_damage.iter().copied() {
+                    add_damage_rect(&mut update_rects, rect);
+                }
             }
         }
 
-        let Some(rect) = update_rect else {
+        if update_rects.is_empty() {
             return;
-        };
+        }
 
         // Convert only damaged RGBA pixels to softbuffer's 0x00RRGGBB format.
-        // The Pixmap is the sole canonical framebuffer; contrast inversion is
-        // a presentation transform and never mutates cached or source pixels.
-        for y in rect.y0 as usize..rect.y1 as usize {
-            let pixel_start = y * width + rect.x0 as usize;
-            let pixel_end = y * width + rect.x1 as usize;
-            let source_start = pixel_start * 4;
-            let source_end = pixel_end * 4;
-            let source_row = &source[source_start..source_end];
-            let destination_row = &mut buffer[pixel_start..pixel_end];
+        // The Pixmap is the sole canonical framebuffer; inversion is a
+        // presentation transform and never mutates cached or source pixels.
+        for rect in &update_rects {
+            for y in rect.y0 as usize..rect.y1 as usize {
+                let pixel_start = y * width + rect.x0 as usize;
+                let pixel_end = y * width + rect.x1 as usize;
+                let source_start = pixel_start * 4;
+                let source_end = pixel_end * 4;
+                let source_row = &source[source_start..source_end];
+                let destination_row = &mut buffer[pixel_start..pixel_end];
 
-            for (destination_pixel, rgba) in destination_row
-                .iter_mut()
-                .zip(source_row.chunks_exact(4))
-            {
-                let pixel = ((rgba[0] as u32) << 16)
-                    | ((rgba[1] as u32) << 8)
-                    | rgba[2] as u32;
-                *destination_pixel = if invert { pixel ^ RGB_INVERT_MASK } else { pixel };
+                for (destination_pixel, rgba) in destination_row
+                    .iter_mut()
+                    .zip(source_row.chunks_exact(4))
+                {
+                    let pixel = ((rgba[0] as u32) << 16)
+                        | ((rgba[1] as u32) << 8)
+                        | rgba[2] as u32;
+                    *destination_pixel = if invert { pixel ^ RGB_INVERT_MASK } else { pixel };
+                }
             }
         }
 
-        let damage = rect.to_softbuffer_rect();
-        let current_damage = self.pending_damage;
-        let result = buffer.present_with_damage(&[damage]);
+        let softbuffer_damage: Vec<Rect> = update_rects
+            .iter()
+            .copied()
+            .map(PixelRect::to_softbuffer_rect)
+            .collect();
+        let current_damage = self.pending_damage.clone();
+        let result = buffer.present_with_damage(&softbuffer_damage);
         if result.is_ok() {
             self.damage_history.push_back(current_damage);
             if self.damage_history.len() > 8 {
                 self.damage_history.pop_front();
             }
-            self.pending_damage = None;
+            self.pending_damage.clear();
         }
     }
 
@@ -1731,6 +1815,15 @@ impl ApplicationHandler for MathCanvasApp {
 
     fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
         let now = Instant::now();
+
+        // Coalesce all drawing/erasing pointer events received since the last
+        // wait boundary into one redraw request. This path has no fixed timer.
+        if self.event_batch_redraw_pending {
+            self.event_batch_redraw_pending = false;
+            if let Some(win) = &self.window {
+                win.request_redraw();
+            }
+        }
 
         // 1. Has the user stopped zooming?
         let zoom_finished = self.is_zooming
@@ -1822,6 +1915,7 @@ impl ApplicationHandler for MathCanvasApp {
                     self.zoom_settle_deadline = None;
 
                     self.redraw_pending = false;
+                    self.event_batch_redraw_pending = false;
                     self.next_frame_deadline = None;
 
                     // Cancel temporary panning state.
@@ -1832,8 +1926,8 @@ impl ApplicationHandler for MathCanvasApp {
                     self.frame_pixmap = Pixmap::new(size.width, size.height);
 
                     self.damage_history.clear();
-                    self.pending_damage = None;
-                    self.pending_tile_damage = None;
+                    self.pending_damage.clear();
+                    self.pending_tile_damage.clear();
 
                     self.cache_dirty = true;
 
@@ -1870,9 +1964,7 @@ impl ApplicationHandler for MathCanvasApp {
                                 self.unregister_stroke_from_tiles(stroke_id, removed_stroke.bounds);
                             }
                             self.rebuild_stroke_id_to_index();
-                            if let Some(damage) =
-                                self.screen_damage_for_world_bounds(removed_stroke.bounds)
-                            {
+                            for damage in self.stroke_damage_rects(&removed_stroke) {
                                 self.add_pending_tile_damage(damage);
                             }
 
@@ -1918,7 +2010,7 @@ impl ApplicationHandler for MathCanvasApp {
                         self.is_erasing = true;
 
                         if self.erase_strokes_between(position, position) {
-                            self.schedule_interactive_redraw(event_loop);
+                            self.schedule_event_batch_redraw();
                         }
                     }
                     ElementState::Pressed
@@ -1973,12 +2065,12 @@ impl ApplicationHandler for MathCanvasApp {
 
                         // Commit the stroke to the retained vector document. Existing
                         // rasterized tiles are updated in-place; uncached tiles stay lazy.
-                        let mut commit_damage = None;
+                        let mut commit_damage = Vec::new();
                         let mut commit_succeeded = false;
 
                         if let Some(stroke) = stroke {
                             if let Some(path) = stroke.build_render_path() {
-                                commit_damage = self.stroke_commit_damage_rect(&stroke);
+                                commit_damage = self.stroke_commit_damage_rects(&stroke);
                                 let stroke_id = self.next_stroke_id;
                                 self.next_stroke_id = self.next_stroke_id.wrapping_add(1).max(1);
                                 let bounds = stroke.bounds;
@@ -1996,7 +2088,7 @@ impl ApplicationHandler for MathCanvasApp {
                         // Restore the preview area from the tile renderer. This clears any
                         // temporary polyline pixels and composites the final Bézier stroke.
                         if commit_succeeded {
-                            if let Some(damage) = commit_damage {
+                            for damage in commit_damage {
                                 self.composite_tiles_into_frame(damage);
                             }
                         } else {
@@ -2008,6 +2100,7 @@ impl ApplicationHandler for MathCanvasApp {
                         self.active_points.clear();
                         self.preview_points_rendered = 0;
                         self.redraw_pending = false;
+                        self.event_batch_redraw_pending = false;
 
                         if let Some(win) = &self.window {
                             win.request_redraw();
@@ -2048,7 +2141,8 @@ impl ApplicationHandler for MathCanvasApp {
 
                 self.cursor_screen = position;
 
-                let mut needs_redraw = false;
+                let mut needs_event_batch_redraw = false;
+                let mut needs_throttled_redraw = false;
 
                 if self.is_drawing {
                     let world_pt = self.screen_to_world(position);
@@ -2065,7 +2159,7 @@ impl ApplicationHandler for MathCanvasApp {
                     if should_add_point {
                         // Store input immediately, regardless of rendering frequency.
                         self.active_points.push(world_pt);
-                        needs_redraw = true;
+                        needs_event_batch_redraw = true;
                     }
                 } else if self.is_panning {
                     self.pan[0] += dx;
@@ -2079,13 +2173,17 @@ impl ApplicationHandler for MathCanvasApp {
 
                     if new_offset != self.pan_preview_offset {
                         self.pan_preview_offset = new_offset;
-                        needs_redraw = true;
+                        needs_throttled_redraw = true;
                     }
                 } else if self.is_erasing {
-                    needs_redraw = self.erase_strokes_between(previous_position, position);
+                    needs_event_batch_redraw =
+                        self.erase_strokes_between(previous_position, position);
                 }
 
-                if needs_redraw {
+                if needs_event_batch_redraw {
+                    self.schedule_event_batch_redraw();
+                }
+                if needs_throttled_redraw {
                     self.schedule_interactive_redraw(event_loop);
                 }
             }
@@ -2133,6 +2231,7 @@ impl ApplicationHandler for MathCanvasApp {
             }
             WindowEvent::RedrawRequested => {
                 self.redraw_pending = false;
+                self.event_batch_redraw_pending = false;
 
                 // Don't rebuild the vector canvas while temporary zooming
                 // or temporary panning is active.
@@ -2140,7 +2239,7 @@ impl ApplicationHandler for MathCanvasApp {
                     if self.cache_dirty {
                         self.rebuild_frame_from_tiles();
                         self.cache_dirty = false;
-                        self.pending_tile_damage = None;
+                        self.pending_tile_damage.clear();
 
                         if self.is_drawing {
                             self.preview_points_rendered = 1;
@@ -2151,7 +2250,7 @@ impl ApplicationHandler for MathCanvasApp {
                 }
 
                 if self.is_drawing {
-                    if let Some(damage) = self.draw_pending_preview_segments() {
+                    for damage in self.draw_pending_preview_segments() {
                         self.add_pending_damage(damage);
                     }
                 }
