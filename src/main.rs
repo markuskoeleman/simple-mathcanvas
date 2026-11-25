@@ -30,8 +30,8 @@ const ERASER_MAX_SUBDIVISION_DEPTH: u32 = 12;
 const DEFAULT_STROKE_WIDTH: f32 = 2.2;
 const DEFAULT_STROKE_COLOR: [u8; 4] = [255, 255, 255, 255];
 
-// Maximum frequency for full-frame pan/zoom preview redraws.
-const INTERACTIVE_FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // ~60 FPS
+// Used when winit cannot report the current monitor's refresh rate.
+const DEFAULT_FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // ~60 FPS
 
 // xor colors to invert them
 const RGB_INVERT_MASK: u32 = 0x00FF_FFFF;
@@ -1498,29 +1498,29 @@ impl Presenter {
         damages
     }
 
-    fn render_pan_frame(&mut self, interaction: &InteractionMode) {
+    fn render_pan_frame(&mut self, interaction: &InteractionMode) -> bool {
         let invert = self.invert_contrast;
         let background = if invert { RGB_INVERT_MASK } else { 0 };
         let [dx, dy] = match interaction {
             InteractionMode::Panning { offset, .. } => *offset,
-            _ => return,
+            _ => return false,
         };
 
         let Some(frame) = self.frame_pixmap.as_ref() else {
-            return;
+            return false;
         };
         let width = frame.width() as usize;
         let height = frame.height() as usize;
         let source = frame.data();
 
         let Some(surface) = self.surface.as_mut() else {
-            return;
+            return false;
         };
         let Ok(mut buffer) = surface.buffer_mut() else {
-            return;
+            return false;
         };
         if buffer.len() != width * height {
-            return;
+            return false;
         }
 
         let dx = dx as i64;
@@ -1549,36 +1549,39 @@ impl Presenter {
             }
         }
 
-        let _ = buffer.present();
-        self.damage_history.clear();
-        self.pending_damage.clear();
-        self.pending_damage.push(PixelRect::full(width as u32, height as u32));
+        let presented = buffer.present().is_ok();
+        if presented {
+            self.damage_history.clear();
+            self.pending_damage.clear();
+            self.pending_damage.push(PixelRect::full(width as u32, height as u32));
+        }
+        presented
     }
-    fn render_zoom_frame(&mut self, camera: &Camera, interaction: &InteractionMode) {
+    fn render_zoom_frame(&mut self, camera: &Camera, interaction: &InteractionMode) -> bool {
         let invert = self.invert_contrast;
         let background = if invert { RGB_INVERT_MASK } else { 0 };
         let zoom = camera.zoom;
         let pan = camera.pan;
         let (zoom_origin, pan_origin) = match interaction {
             InteractionMode::Zooming { origin_zoom, origin_pan, .. } => (*origin_zoom, *origin_pan),
-            _ => return,
+            _ => return false,
         };
 
         let Some(frame) = self.frame_pixmap.as_ref() else {
-            return;
+            return false;
         };
         let width = frame.width() as usize;
         let height = frame.height() as usize;
         let source = frame.data();
 
         let Some(surface) = self.surface.as_mut() else {
-            return;
+            return false;
         };
         let Ok(mut buffer) = surface.buffer_mut() else {
-            return;
+            return false;
         };
         if buffer.len() != width * height {
-            return;
+            return false;
         }
 
         let scale = zoom_origin / zoom;
@@ -1608,39 +1611,39 @@ impl Presenter {
         }
 
         let result = buffer.present();
-        if result.is_ok() {
+        let presented = result.is_ok();
+        if presented {
             let full = PixelRect::full(width as u32, height as u32);
             self.damage_history.clear();
             self.damage_history.push_back(vec![full]);
             self.pending_damage.clear();
         }
+        presented
     }
-    fn render(&mut self, camera: &Camera, interaction: &InteractionMode) {
+    fn render(&mut self, camera: &Camera, interaction: &InteractionMode) -> bool {
         let preview_mode = match interaction {
             InteractionMode::Panning { .. } => 1,
             InteractionMode::Zooming { .. } => 2,
             _ => 0,
         };
         if preview_mode == 1 {
-            self.render_pan_frame(interaction);
-            return;
+            return self.render_pan_frame(interaction);
         }
         if preview_mode == 2 {
-            self.render_zoom_frame(camera, interaction);
-            return;
+            return self.render_zoom_frame(camera, interaction);
         }
 
         let invert = self.invert_contrast;
         let (Some(surface), Some(frame)) = (self.surface.as_mut(), self.frame_pixmap.as_ref())
         else {
-            return;
+            return false;
         };
         let width = frame.width() as usize;
         let height = frame.height() as usize;
         let source = frame.data();
 
         let Ok(mut buffer) = surface.buffer_mut() else {
-            return;
+            return false;
         };
         debug_assert_eq!(buffer.len(), width * height);
 
@@ -1671,7 +1674,7 @@ impl Presenter {
         }
 
         if self.update_rects.is_empty() {
-            return;
+            return false;
         }
 
         // Convert only damaged RGBA pixels to softbuffer's 0x00RRGGBB format.
@@ -1701,8 +1704,8 @@ impl Presenter {
         self.softbuffer_damage.clear();
         self.softbuffer_damage
             .extend(self.update_rects.iter().copied().map(PixelRect::to_softbuffer_rect));
-        let result = buffer.present_with_damage(&self.softbuffer_damage);
-        if result.is_ok() {
+        let presented = buffer.present_with_damage(&self.softbuffer_damage).is_ok();
+        if presented {
             // Rotate damage vectors through a small pool. This avoids cloning
             // the current rectangles and, after the history fills, reuses the
             // oldest vector's allocation for the next frame.
@@ -1716,6 +1719,7 @@ impl Presenter {
                 }
             }
         }
+        presented
     }
 
     fn add_damage(&mut self, rect: PixelRect) {
@@ -1741,9 +1745,13 @@ struct MathCanvasApp {
     interaction: Interaction,
     tile_renderer: TileRenderer,
     presenter: Presenter,
-    redraw_pending: bool,
-    event_batch_redraw_pending: bool,
-    next_frame_deadline: Option<Instant>,
+    redraw_wanted: bool,
+    frame_interval: Duration,
+    last_present: Option<Instant>,
+    #[cfg(debug_assertions)]
+    presents_in_window: u32,
+    #[cfg(debug_assertions)]
+    present_window_started: Option<Instant>,
 }
 
 impl Default for MathCanvasApp {
@@ -1755,9 +1763,13 @@ impl Default for MathCanvasApp {
             interaction: Interaction::default(),
             tile_renderer: TileRenderer::default(),
             presenter: Presenter::default(),
-            redraw_pending: false,
-            event_batch_redraw_pending: false,
-            next_frame_deadline: None,
+            redraw_wanted: false,
+            frame_interval: DEFAULT_FRAME_INTERVAL,
+            last_present: None,
+            #[cfg(debug_assertions)]
+            presents_in_window: 0,
+            #[cfg(debug_assertions)]
+            present_window_started: None,
         }
     }
 }
@@ -1819,23 +1831,41 @@ impl MathCanvasApp {
         self.tile_renderer.mark_frame_dirty();
         self.ensure_frame_current();
         self.update_brush_cursor(event_loop);
-        self.redraw_pending = false;
-        self.next_frame_deadline = None;
+        self.redraw_wanted = false;
     }
 
-    // Drawing and erasing request one redraw after the current event batch.
-    // This avoids imposing a fixed 60 Hz timer on pen input and naturally
-    // follows the platform's event cadence (including 120/144 Hz displays).
-    fn schedule_event_batch_redraw(&mut self) {
-        self.event_batch_redraw_pending = true;
+    // Every interactive input path shares one leading-edge frame throttle.
+    // The first requested frame after idle is immediate; later ones are due
+    // one monitor interval after the last successful presentation.
+    fn schedule_redraw(&mut self) {
+        self.redraw_wanted = true;
     }
 
-    // Camera previews are intentionally throttled to avoid excessive full-frame
-    // resampling while panning or zooming.
-    fn schedule_interactive_redraw(&mut self, event_loop: &dyn ActiveEventLoop) {
-        self.redraw_pending = true;
-        let deadline = self.next_frame_deadline.unwrap_or_else(Instant::now);
-        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+    // Avoid re-arming the platform timer when the effective control flow did
+    // not change. In particular, repeated input events share one fixed deadline.
+    fn set_control_flow_if_changed(
+        event_loop: &dyn ActiveEventLoop,
+        control_flow: ControlFlow,
+    ) {
+        if event_loop.control_flow() != control_flow {
+            event_loop.set_control_flow(control_flow);
+        }
+    }
+
+    // Winit 0.31 exposes the active mode through current_monitor() and
+    // MonitorHandle::current_video_mode(). A missing mode (common on some
+    // compositors) falls back to 60 Hz.
+    fn update_frame_interval(&mut self) {
+        let refresh_millihertz = self
+            .window
+            .as_ref()
+            .and_then(|window| window.current_monitor())
+            .and_then(|monitor| monitor.current_video_mode())
+            .and_then(|mode| mode.refresh_rate_millihertz());
+
+        self.frame_interval = refresh_millihertz
+            .map(|rate| Duration::from_nanos(1_000_000_000_000_u64 / u64::from(rate.get())))
+            .unwrap_or(DEFAULT_FRAME_INTERVAL);
     }
 
     fn ensure_frame_current(&mut self) {
@@ -2022,8 +2052,64 @@ impl MathCanvasApp {
     }
 
 
-    fn render(&mut self) {
-        self.presenter.render(&self.camera, &self.interaction.mode);
+    fn render(&mut self) -> bool {
+        self.presenter.render(&self.camera, &self.interaction.mode)
+    }
+
+    fn redraw(&mut self) {
+        let started = Instant::now();
+        self.redraw_wanted = false;
+
+        // The canonical frame is recomposited only outside temporary
+        // pan/zoom previews. A drawing preview is replayed afterwards.
+        let camera_preview_active = matches!(
+            &self.interaction.mode,
+            InteractionMode::Zooming { .. } | InteractionMode::Panning { .. }
+        );
+        if !camera_preview_active {
+            if self.tile_renderer.frame_is_dirty() {
+                self.rebuild_frame_from_tiles();
+                self.tile_renderer.mark_frame_clean();
+                if let InteractionMode::Drawing { rendered, .. } = &mut self.interaction.mode {
+                    *rendered = 1;
+                }
+            } else {
+                self.refresh_pending_tile_damage();
+            }
+        }
+
+        if matches!(&self.interaction.mode, InteractionMode::Drawing { .. }) {
+            for damage in self.draw_pending_preview_segments() {
+                self.presenter.add_damage(damage);
+            }
+        }
+        if self.render() {
+            // Stamp the beginning of the successful frame, not its completion.
+            self.last_present = Some(started);
+
+            // Lightweight debug instrumentation for checking the delivered
+            // presentation rate while drawing or navigating the canvas.
+            #[cfg(debug_assertions)]
+            {
+                match self.present_window_started {
+                    Some(window_started) => {
+                        self.presents_in_window += 1;
+                        let elapsed = window_started.elapsed();
+                        if elapsed >= Duration::from_secs(1) {
+                            let presents_per_second =
+                                f64::from(self.presents_in_window) / elapsed.as_secs_f64();
+                            eprintln!("[math-canvas] presents: {presents_per_second:.1} FPS");
+                            self.presents_in_window = 0;
+                            self.present_window_started = Some(Instant::now());
+                        }
+                    }
+                    None => {
+                        self.presents_in_window = 1;
+                        self.present_window_started = Some(started);
+                    }
+                }
+            }
+        }
     }
 }
 impl ApplicationHandler for MathCanvasApp {
@@ -2044,6 +2130,7 @@ impl ApplicationHandler for MathCanvasApp {
         }
 
         self.window = Some(window);
+        self.update_frame_interval();
         self.presenter.set_surface(surface);
 
         // Initialise the native brush cursor.
@@ -2060,62 +2147,75 @@ impl ApplicationHandler for MathCanvasApp {
     fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
         let now = Instant::now();
 
-        // Coalesce drawing/erasing pointer events at the event-batch boundary.
-        if self.event_batch_redraw_pending {
-            self.event_batch_redraw_pending = false;
-            if let Some(win) = &self.window {
-                win.request_redraw();
-            }
-        }
-
-        // All zoom completion paths share finish_zoom_interaction().
+        // Finalize zoom before considering preview work so a single frame is
+        // rendered from the newly rebuilt canonical framebuffer.
         let zoom_finished = matches!(
             &self.interaction.mode,
             InteractionMode::Zooming { settle_at, .. } if now >= *settle_at
         );
         if zoom_finished {
             self.finish_zoom_interaction(event_loop);
-            if let Some(win) = &self.window {
-                win.request_redraw();
-            }
-            event_loop.set_control_flow(ControlFlow::Wait);
+            self.redraw();
+            Self::set_control_flow_if_changed(event_loop, ControlFlow::Wait);
             return;
         }
 
-        // Pan/zoom preview frames remain rate-limited independently of pen input.
-        if self.redraw_pending {
-            let deadline = self.next_frame_deadline.unwrap_or(now);
-            if now >= deadline {
-                self.redraw_pending = false;
-                self.next_frame_deadline = Some(now + INTERACTIVE_FRAME_INTERVAL);
-                if let Some(win) = &self.window {
-                    win.request_redraw();
-                }
+        // All interactive changes (pen, eraser, pan and zoom) use the same
+        // leading-edge cap. Draw directly here; do not queue RedrawRequested.
+        if self.redraw_wanted {
+            let due = self
+                .last_present
+                .map(|last| last + self.frame_interval)
+                .unwrap_or(now);
+            if now >= due {
+                self.redraw_wanted = false;
+                self.redraw();
             }
         }
 
-        let frame_deadline = if self.redraw_pending {
-            Some(self.next_frame_deadline.unwrap_or(now))
+        // Recheck against a fresh clock before arming a timer. This also handles
+        // the edge case where the deadline passes during this callback: render
+        // now instead of setting WaitUntil to an already-expired Instant.
+        let mut now = Instant::now();
+        let frame_deadline = if self.redraw_wanted {
+            let due = self
+                .last_present
+                .map(|last| last + self.frame_interval)
+                .unwrap_or(now);
+            if due <= now {
+                self.redraw_wanted = false;
+                self.redraw();
+                now = Instant::now();
+                None
+            } else {
+                Some(due)
+            }
         } else {
             None
         };
+
+        // Rendering can take long enough for a zoom gesture to settle. Use the
+        // fresh timestamp above and finalize immediately rather than arming a
+        // timer in the past.
         let zoom_deadline = match &self.interaction.mode {
-            InteractionMode::Zooming { settle_at, .. } => Some(*settle_at),
+            InteractionMode::Zooming { settle_at, .. } if *settle_at > now => Some(*settle_at),
+            InteractionMode::Zooming { .. } => {
+                self.finish_zoom_interaction(event_loop);
+                self.redraw();
+                Self::set_control_flow_if_changed(event_loop, ControlFlow::Wait);
+                return;
+            }
             _ => None,
         };
 
-        let next_deadline = match (frame_deadline, zoom_deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        };
-
-        if let Some(deadline) = next_deadline {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-        } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
-        }
+        let next_deadline = [frame_deadline, zoom_deadline]
+            .into_iter()
+            .flatten()
+            .min();
+        let control_flow = next_deadline
+            .map(ControlFlow::WaitUntil)
+            .unwrap_or(ControlFlow::Wait);
+        Self::set_control_flow_if_changed(event_loop, control_flow);
     }
 
     fn window_event(
@@ -2127,15 +2227,14 @@ impl ApplicationHandler for MathCanvasApp {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::SurfaceResized(size) => {
+                self.update_frame_interval();
                 if let (Some(w), Some(h)) =
                     (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
                 {
                     self.presenter.resize_surface(w, h);
                     // The viewport changed, so cancel any gesture-local state.
                     self.interaction.mode = InteractionMode::Idle;
-                    self.redraw_pending = false;
-                    self.event_batch_redraw_pending = false;
-                    self.next_frame_deadline = None;
+                    self.redraw_wanted = false;
 
                     self.presenter.set_frame_size(size.width, size.height);
                     self.tile_renderer.clear_frame_damage();
@@ -2146,6 +2245,9 @@ impl ApplicationHandler for MathCanvasApp {
                         win.request_redraw();
                     }
                 }
+            }
+            WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                self.update_frame_interval();
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.interaction.inputs.shift = modifiers.state().shift_key();
@@ -2219,7 +2321,7 @@ impl ApplicationHandler for MathCanvasApp {
                             self.ensure_frame_current();
                             self.interaction.mode = InteractionMode::Erasing;
                             if self.erase_strokes_between(position, position) {
-                                self.schedule_event_batch_redraw();
+                                self.schedule_redraw();
                             }
                         } else if is_primary_press
                             && !self.interaction.inputs.space
@@ -2232,9 +2334,6 @@ impl ApplicationHandler for MathCanvasApp {
                                 points: vec![self.screen_to_world(position)],
                                 rendered: 1,
                             };
-                            if let Some(win) = &self.window {
-                                win.request_redraw();
-                            }
                         } else if (is_middle_press || is_primary_press) && can_start_interaction {
                             self.finish_zoom_interaction(event_loop);
                             self.ensure_frame_current();
@@ -2309,8 +2408,7 @@ impl ApplicationHandler for MathCanvasApp {
                             self.rebuild_frame_from_tiles();
                         }
 
-                        self.redraw_pending = false;
-                        self.event_batch_redraw_pending = false;
+                        self.redraw_wanted = false;
                         if let Some(win) = &self.window {
                             win.request_redraw();
                         }
@@ -2320,8 +2418,7 @@ impl ApplicationHandler for MathCanvasApp {
                     {
                         self.interaction.mode = InteractionMode::Idle;
                         self.tile_renderer.mark_frame_dirty();
-                        self.redraw_pending = false;
-                        self.next_frame_deadline = None;
+                        self.redraw_wanted = false;
                         if let Some(win) = &self.window {
                             win.request_redraw();
                         }
@@ -2341,8 +2438,7 @@ impl ApplicationHandler for MathCanvasApp {
 
                 let world_point = self.screen_to_world(position);
                 let zoom = self.camera.zoom;
-                let mut needs_event_batch_redraw = false;
-                let mut needs_throttled_redraw = false;
+                let mut needs_redraw = false;
                 let mut should_erase = false;
 
                 match &mut self.interaction.mode {
@@ -2355,7 +2451,7 @@ impl ApplicationHandler for MathCanvasApp {
                         });
                         if should_add_point {
                             points.push(world_point);
-                            needs_event_batch_redraw = true;
+                            needs_redraw = true;
                         }
                     }
                     InteractionMode::Panning { origin, offset } => {
@@ -2366,7 +2462,7 @@ impl ApplicationHandler for MathCanvasApp {
                         ];
                         if new_offset != *offset {
                             *offset = new_offset;
-                            needs_throttled_redraw = true;
+                            needs_redraw = true;
                         }
                     }
                     InteractionMode::Erasing => should_erase = true,
@@ -2374,14 +2470,10 @@ impl ApplicationHandler for MathCanvasApp {
                 }
 
                 if should_erase {
-                    needs_event_batch_redraw =
-                        self.erase_strokes_between(previous_position, position);
+                    needs_redraw |= self.erase_strokes_between(previous_position, position);
                 }
-                if needs_event_batch_redraw {
-                    self.schedule_event_batch_redraw();
-                }
-                if needs_throttled_redraw {
-                    self.schedule_interactive_redraw(event_loop);
+                if needs_redraw {
+                    self.schedule_redraw();
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -2418,37 +2510,9 @@ impl ApplicationHandler for MathCanvasApp {
                 if let InteractionMode::Zooming { settle_at, .. } = &mut self.interaction.mode {
                     *settle_at = Instant::now() + ZOOM_SETTLE_DELAY;
                 }
-                self.schedule_interactive_redraw(event_loop);
+                self.schedule_redraw();
             }
-            WindowEvent::RedrawRequested => {
-                self.redraw_pending = false;
-                self.event_batch_redraw_pending = false;
-
-                // The canonical frame is recomposited only outside temporary
-                // pan/zoom previews. A drawing preview is replayed afterwards.
-                let camera_preview_active = matches!(
-                    &self.interaction.mode,
-                    InteractionMode::Zooming { .. } | InteractionMode::Panning { .. }
-                );
-                if !camera_preview_active {
-                    if self.tile_renderer.frame_is_dirty() {
-                        self.rebuild_frame_from_tiles();
-                        self.tile_renderer.mark_frame_clean();
-                        if let InteractionMode::Drawing { rendered, .. } = &mut self.interaction.mode {
-                            *rendered = 1;
-                        }
-                    } else {
-                        self.refresh_pending_tile_damage();
-                    }
-                }
-
-                if matches!(&self.interaction.mode, InteractionMode::Drawing { .. }) {
-                    for damage in self.draw_pending_preview_segments() {
-                        self.presenter.add_damage(damage);
-                    }
-                }
-                self.render();
-            }
+            WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::Focused(false) => {
                 // Focus changes can suppress release events. Cancel the active
                 // gesture and rebuild to discard any temporary preview pixels.
@@ -2456,9 +2520,7 @@ impl ApplicationHandler for MathCanvasApp {
                 if !matches!(&self.interaction.mode, InteractionMode::Idle) {
                     self.interaction.mode = InteractionMode::Idle;
                     self.tile_renderer.mark_frame_dirty();
-                    self.redraw_pending = false;
-                    self.event_batch_redraw_pending = false;
-                    self.next_frame_deadline = None;
+                    self.redraw_wanted = false;
                     if let Some(win) = &self.window {
                         win.request_redraw();
                     }
@@ -2473,7 +2535,6 @@ impl ApplicationHandler for MathCanvasApp {
 }
 fn main() {
     let event_loop = EventLoop::new().unwrap();
-    event_loop.set_control_flow(ControlFlow::Wait);
     let app = MathCanvasApp::default();
     event_loop.run_app(app).unwrap();
 }
