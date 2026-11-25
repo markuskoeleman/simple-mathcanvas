@@ -33,18 +33,17 @@ const DEFAULT_STROKE_COLOR: [u8; 4] = [255, 255, 255, 255];
 // Maximum frequency for interactive canvas redraws.
 const INTERACTIVE_FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // ~60 FPS
 
-const BACKGROUND_PIXEL: u32 = 0x00000000;
-
 // xor colors to invert them
 const RGB_INVERT_MASK: u32 = 0x00FF_FFFF;
 
 // How long scrolling must stop before committing the final vector rendering.
 const ZOOM_SETTLE_DELAY: Duration = Duration::from_millis(180);
 
-// World-aligned CPU raster tiles. The raster scale is quantised to four
-// steps per octave, keeping resampling modest while allowing cached
-// tiles to be reused during ordinary panning and small zoom changes.
+// World-aligned CPU raster tiles. Raster tiles are cached independently for
+// each quantised zoom level; the spatial index below uses a separate fixed
+// world-space grid and is therefore unaffected by zoom changes.
 const TILE_SIZE_PX: u32 = 512;
+const SPATIAL_CELL_WORLD_SIZE: f32 = 512.0;
 // Enough raster padding for the current 2.2-world-unit brush at maximum zoom
 // (including antialiasing). Increase this if much wider brushes are introduced.
 const TILE_GUTTER_PX: u32 = 32;
@@ -221,30 +220,33 @@ struct TileCoord {
     y: i32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct RasterTileKey {
+    level: i32,
+    coord: TileCoord,
+}
+
 struct CachedTile {
     pixmap: Pixmap,
     last_used: u64,
 }
 
 struct TileRenderCache {
-    zoom_level: i32,
-    raster_scale: f32,
-    world_size: f32,
-    // Stable stroke IDs preserve membership across Vec compaction/removals.
-    stroke_ids_by_tile: HashMap<TileCoord, Vec<u64>>,
-    tiles_by_stroke: HashMap<u64, Vec<TileCoord>>,
-    rendered_tiles: HashMap<TileCoord, CachedTile>,
+    // Fixed world-space spatial grid, independent of raster zoom level.
+    spatial_index_built: bool,
+    stroke_ids_by_cell: HashMap<TileCoord, Vec<u64>>,
+    cells_by_stroke: HashMap<u64, Vec<TileCoord>>,
+    // Raster tiles from multiple zoom levels coexist in this LRU cache.
+    rendered_tiles: HashMap<RasterTileKey, CachedTile>,
     usage_clock: u64,
 }
 
 impl Default for TileRenderCache {
     fn default() -> Self {
         Self {
-            zoom_level: i32::MIN,
-            raster_scale: 1.0,
-            world_size: TILE_SIZE_PX as f32,
-            stroke_ids_by_tile: HashMap::new(),
-            tiles_by_stroke: HashMap::new(),
+            spatial_index_built: false,
+            stroke_ids_by_cell: HashMap::new(),
+            cells_by_stroke: HashMap::new(),
             rendered_tiles: HashMap::new(),
             usage_clock: 0,
         }
@@ -297,8 +299,6 @@ fn composite_tile_region(
     zoom: f32,
     pan: [f32; 2],
     x_samples: &mut Vec<BilinearXSample>,
-    packed_destination: &mut [u32],
-    invert_contrast: bool,
 ) {
     let tile_left = coord.x as f32 * tile_world_size * zoom + pan[0];
     let tile_top = coord.y as f32 * tile_world_size * zoom + pan[1];
@@ -323,39 +323,24 @@ fn composite_tile_region(
 
     let source_width = source.width() as usize;
     let source_height = source.height() as usize;
-    let destination_width = destination.width() as usize;
-
+    let destination_stride = destination.width() as usize * 4;
     let source_stride = source_width * 4;
-    let destination_stride = destination_width * 4;
-
     let source_data = source.data();
     let destination_data = destination.data_mut();
-
     let gutter = TILE_GUTTER_PX as f32;
-
     let max_source_x = source_width.saturating_sub(1) as f32;
     let max_source_y = source_height.saturating_sub(1) as f32;
 
-    // ---------------------------------------------------------
-    // Precalculate horizontal sampling coordinates.
-    //
-    // These coordinates are identical for every destination row,
-    // so we only need to calculate them once per tile.
-    // ---------------------------------------------------------
-
+    // Horizontal sampling coordinates are shared by every row of this tile.
     x_samples.clear();
-
     let sample_count = (x1 - x0) as usize;
     x_samples.reserve(sample_count);
 
     for x in x0..x1 {
         let source_x = ((x as f32 + 0.5 - tile_left) / zoom) * raster_scale + gutter - 0.5;
-
         let source_x = source_x.clamp(0.0, max_source_x);
-
         let sx0 = source_x.floor() as usize;
         let sx1 = (sx0 + 1).min(source_width - 1);
-
         x_samples.push(BilinearXSample {
             x0: sx0 * 4,
             x1: sx1 * 4,
@@ -363,78 +348,47 @@ fn composite_tile_region(
         });
     }
 
-    // ---------------------------------------------------------
-    // Composite each destination row.
-    // ---------------------------------------------------------
-
     for y in y0..y1 {
         let source_y = ((y as f32 + 0.5 - tile_top) / zoom) * raster_scale + gutter - 0.5;
-
         let source_y = source_y.clamp(0.0, max_source_y);
-
         let sy0 = source_y.floor() as usize;
         let sy1 = (sy0 + 1).min(source_height - 1);
-
         let fy = source_y - sy0 as f32;
         let inv_fy = 1.0 - fy;
 
-        // Obtain contiguous source row slices.
         let row0_start = sy0 * source_stride;
         let row1_start = sy1 * source_stride;
-
         let row0 = &source_data[row0_start..row0_start + source_stride];
         let row1 = &source_data[row1_start..row1_start + source_stride];
 
-        // Obtain the contiguous destination row slice.
         let destination_start = y as usize * destination_stride + x0 as usize * 4;
-
         let destination_end = destination_start + sample_count * 4;
-
         let destination_row = &mut destination_data[destination_start..destination_end];
 
-        // Corresponding row in the packed framebuffer.
-        let packed_start = y as usize * destination_width + x0 as usize;
-        let packed_end = packed_start + sample_count;
-
-        let packed_row = &mut packed_destination[packed_start..packed_end];
-
-        // Bilinear interpolation.
-        for ((dst, packed_dst), sample) in destination_row
+        for (dst, sample) in destination_row
             .chunks_exact_mut(4)
-            .zip(packed_row.iter_mut())
             .zip(x_samples.iter())
         {
             let fx = sample.fx;
             let inv_fx = 1.0 - fx;
-
             let sx0 = sample.x0;
             let sx1 = sample.x1;
-
-            // Calculate final RGB values.
             let mut rgb = [0u8; 3];
 
             for channel in 0..3 {
-                let top = row0[sx0 + channel] as f32 * inv_fx + row0[sx1 + channel] as f32 * fx;
-
-                let bottom = row1[sx0 + channel] as f32 * inv_fx + row1[sx1 + channel] as f32 * fx;
-
-                rgb[channel] = (top * inv_fy + bottom * fy).round().clamp(0.0, 255.0) as u8;
+                let top = row0[sx0 + channel] as f32 * inv_fx
+                    + row0[sx1 + channel] as f32 * fx;
+                let bottom = row1[sx0 + channel] as f32 * inv_fx
+                    + row1[sx1 + channel] as f32 * fx;
+                rgb[channel] = (top * inv_fy + bottom * fy)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
             }
 
-            // 1. Write RGBA framebuffer.
             dst[0] = rgb[0];
             dst[1] = rgb[1];
             dst[2] = rgb[2];
             dst[3] = 255;
-
-            // 2. Write packed framebuffer.
-            let pixel = ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | (rgb[2] as u32);
-
-            *packed_dst = if invert_contrast {
-                pixel ^ RGB_INVERT_MASK
-            } else {
-                pixel
-            };
         }
     }
 }
@@ -764,12 +718,6 @@ struct MathCanvasApp {
     // Temporary bitmap panning
     pan_origin: [f32; 2],
     pan_preview_offset: [i32; 2],
-    // Immutable snapshot of the packed canvas at pan start.
-    pan_source_frame: Option<Vec<u32>>,
-
-    // Packed 0x00RRGGBB framebuffer, ready for softbuffer.
-    packed_frame: Vec<u32>,
-
     // Regions modified since the last presentation.
     pending_damage: Option<PixelRect>,
 
@@ -778,7 +726,6 @@ struct MathCanvasApp {
 
     // Temporary bitmap zooming
     is_zooming: bool,
-    zoom_source_frame: Option<Vec<u32>>,
     zoom_origin: f32,
     zoom_pan_origin: [f32; 2],
     zoom_settle_deadline: Option<Instant>,
@@ -821,14 +768,10 @@ impl Default for MathCanvasApp {
 
             pan_origin: [0.0, 0.0],
             pan_preview_offset: [0, 0],
-            pan_source_frame: None,
-
-            packed_frame: Vec::new(),
             pending_damage: None,
             damage_history: VecDeque::new(),
 
             is_zooming: false,
-            zoom_source_frame: None,
             zoom_origin: 1.0,
             zoom_pan_origin: [0.0, 0.0],
             zoom_settle_deadline: None,
@@ -929,36 +872,38 @@ impl MathCanvasApp {
         damage
     }
 
-    fn ensure_tile_index_current(&mut self) {
-        let level = tile_zoom_level(self.zoom);
-        if self.tile_cache.zoom_level == level {
+    fn ensure_spatial_index_current(&mut self) {
+        if self.tile_cache.spatial_index_built {
             return;
         }
 
-        let raster_scale = 2.0_f32.powf(level as f32 * 0.25).max(0.0001);
-        let world_size = TILE_SIZE_PX as f32 / raster_scale;
-        self.tile_cache.zoom_level = level;
-        self.tile_cache.raster_scale = raster_scale;
-        self.tile_cache.world_size = world_size;
-        self.tile_cache.stroke_ids_by_tile.clear();
-        self.tile_cache.tiles_by_stroke.clear();
-        self.tile_cache.rendered_tiles.clear();
+        self.tile_cache.stroke_ids_by_cell.clear();
+        self.tile_cache.cells_by_stroke.clear();
 
-        let gutter_world = TILE_GUTTER_PX as f32 / raster_scale;
         for (index, stroke) in self.strokes.iter().enumerate() {
             let Some(&stroke_id) = self.stroke_ids.get(index) else {
                 continue;
             };
-            let coords = tile_coords_for_bounds(stroke.bounds, world_size, gutter_world);
-            for coord in &coords {
+            let cells = tile_coords_for_bounds(
+                stroke.bounds,
+                SPATIAL_CELL_WORLD_SIZE,
+                0.0,
+            );
+            for cell in &cells {
                 self.tile_cache
-                    .stroke_ids_by_tile
-                    .entry(*coord)
+                    .stroke_ids_by_cell
+                    .entry(*cell)
                     .or_default()
                     .push(stroke_id);
             }
-            self.tile_cache.tiles_by_stroke.insert(stroke_id, coords);
+            self.tile_cache.cells_by_stroke.insert(stroke_id, cells);
         }
+
+        self.tile_cache.spatial_index_built = true;
+    }
+
+    fn raster_scale_for_level(level: i32) -> f32 {
+        2.0_f32.powf(level as f32 * 0.25).max(0.0001)
     }
 
     fn rebuild_stroke_id_to_index(&mut self) {
@@ -970,94 +915,129 @@ impl MathCanvasApp {
     }
 
     fn register_stroke_in_tiles(&mut self, stroke_id: u64, bounds: [f32; 4]) {
-        self.ensure_tile_index_current();
-        // A zoom-level rebuild may already have indexed this stroke (e.g. if
-        // the camera scale changed immediately before the commit).
-        if self.tile_cache.tiles_by_stroke.contains_key(&stroke_id) {
-            return;
+        self.ensure_spatial_index_current();
+
+        // If the index was lazily built after this stroke entered the document,
+        // it already contains this ID. Otherwise, add it to the fixed grid now.
+        if !self.tile_cache.cells_by_stroke.contains_key(&stroke_id) {
+            let cells = tile_coords_for_bounds(bounds, SPATIAL_CELL_WORLD_SIZE, 0.0);
+            for cell in &cells {
+                self.tile_cache
+                    .stroke_ids_by_cell
+                    .entry(*cell)
+                    .or_default()
+                    .push(stroke_id);
+            }
+            self.tile_cache.cells_by_stroke.insert(stroke_id, cells);
         }
 
-        let coords = tile_coords_for_bounds(
-            bounds,
-            self.tile_cache.world_size,
-            TILE_GUTTER_PX as f32 / self.tile_cache.raster_scale,
-        );
-
-        // Resolve the committed stroke once. Its ID/index and render path were
-        // added to the parallel document arrays immediately before this call.
-        let stroke_index = self.stroke_id_to_index.get(&stroke_id).copied();
-        let stroke = stroke_index.and_then(|index| self.strokes.get(index));
-        let path = stroke_index.and_then(|index| self.stroke_cache.paths.get(index));
-        let raster_scale = self.tile_cache.raster_scale;
+        // Existing raster tiles at any cached zoom level can be updated in
+        // place because the new stroke is topmost. Unrendered tiles stay lazy.
+        let Some(&index) = self.stroke_id_to_index.get(&stroke_id) else {
+            return;
+        };
+        let (Some(stroke), Some(path)) = (
+            self.strokes.get(index),
+            self.stroke_cache.paths.get(index),
+        ) else {
+            return;
+        };
         self.tile_cache.usage_clock = self.tile_cache.usage_clock.wrapping_add(1);
         let use_stamp = self.tile_cache.usage_clock;
+        let rendered_tiles = &mut self.tile_cache.rendered_tiles;
 
-        for coord in &coords {
-            self.tile_cache
-                .stroke_ids_by_tile
-                .entry(*coord)
-                .or_default()
-                .push(stroke_id);
-
-            // A newly committed stroke is always topmost. Append it directly
-            // to already-rendered tiles instead of discarding and rebuilding
-            // all previous strokes in those tiles. Keep other tiles lazy.
-            if let (Some(stroke), Some(path), Some(tile)) = (
-                stroke,
-                path,
-                self.tile_cache.rendered_tiles.get_mut(coord),
-            ) {
+        for (key, tile) in rendered_tiles.iter_mut() {
+            let raster_scale = Self::raster_scale_for_level(key.level);
+            let world_size = TILE_SIZE_PX as f32 / raster_scale;
+            let gutter_world = TILE_GUTTER_PX as f32 / raster_scale;
+            let touched = tile_coords_for_bounds(bounds, world_size, gutter_world);
+            if touched.contains(&key.coord) {
                 tile.last_used = use_stamp;
-                stroke.draw_to_pixmap(path, &mut tile.pixmap, tile_transform(*coord, raster_scale));
+                stroke.draw_to_pixmap(path, &mut tile.pixmap, tile_transform(key.coord, raster_scale));
             }
         }
-        self.tile_cache.tiles_by_stroke.insert(stroke_id, coords);
     }
 
-    fn unregister_stroke_from_tiles(&mut self, stroke_id: u64) {
-        if let Some(coords) = self.tile_cache.tiles_by_stroke.remove(&stroke_id) {
-            for coord in coords {
+    fn unregister_stroke_from_tiles(&mut self, stroke_id: u64, bounds: [f32; 4]) {
+        if let Some(cells) = self.tile_cache.cells_by_stroke.remove(&stroke_id) {
+            for cell in cells {
                 let remove_entry =
-                    if let Some(ids) = self.tile_cache.stroke_ids_by_tile.get_mut(&coord) {
+                    if let Some(ids) = self.tile_cache.stroke_ids_by_cell.get_mut(&cell) {
                         ids.retain(|id| *id != stroke_id);
                         ids.is_empty()
                     } else {
                         false
                     };
                 if remove_entry {
-                    self.tile_cache.stroke_ids_by_tile.remove(&coord);
+                    self.tile_cache.stroke_ids_by_cell.remove(&cell);
                 }
-                self.tile_cache.rendered_tiles.remove(&coord);
             }
         }
+
+        // A removed stroke cannot be unpainted. Invalidate only cached raster
+        // tiles intersecting its padded bounds, at every retained zoom level.
+        let affected: Vec<RasterTileKey> = self
+            .tile_cache
+            .rendered_tiles
+            .keys()
+            .copied()
+            .filter(|key| {
+                let raster_scale = Self::raster_scale_for_level(key.level);
+                let world_size = TILE_SIZE_PX as f32 / raster_scale;
+                let gutter_world = TILE_GUTTER_PX as f32 / raster_scale;
+                tile_coords_for_bounds(bounds, world_size, gutter_world).contains(&key.coord)
+            })
+            .collect();
+        for key in affected {
+            self.tile_cache.rendered_tiles.remove(&key);
+        }
+
         self.stroke_id_to_index.remove(&stroke_id);
     }
 
-    fn ensure_tile_rendered(&mut self, coord: TileCoord) {
+    fn ensure_tile_rendered(&mut self, level: i32, coord: TileCoord) {
+        let key = RasterTileKey { level, coord };
         self.tile_cache.usage_clock = self.tile_cache.usage_clock.wrapping_add(1);
         let use_stamp = self.tile_cache.usage_clock;
-        if let Some(tile) = self.tile_cache.rendered_tiles.get_mut(&coord) {
+        if let Some(tile) = self.tile_cache.rendered_tiles.get_mut(&key) {
             tile.last_used = use_stamp;
             return;
         }
 
-        let Some(stroke_ids) = self
-            .tile_cache
-            .stroke_ids_by_tile
-            .get(&coord)
-            .filter(|ids| !ids.is_empty())
-            .cloned()
-        else {
-            // Empty tiles are just the canvas background. Do not allocate a
-            // 576x576 RGBA pixmap to cache a solid colour; the compositor
-            // clears the affected destination rectangle before drawing tiles.
+        let raster_scale = Self::raster_scale_for_level(level);
+        let world_size = TILE_SIZE_PX as f32 / raster_scale;
+        let gutter_world = TILE_GUTTER_PX as f32 / raster_scale;
+        let tile_bounds = [
+            coord.x as f32 * world_size - gutter_world,
+            coord.y as f32 * world_size - gutter_world,
+            (coord.x as f32 + 1.0) * world_size + gutter_world,
+            (coord.y as f32 + 1.0) * world_size + gutter_world,
+        ];
+
+        // Query the zoom-independent spatial grid for strokes intersecting
+        // this raster tile, then restore document order using stable IDs.
+        let spatial_cells = tile_coords_for_bounds(
+            tile_bounds,
+            SPATIAL_CELL_WORLD_SIZE,
+            0.0,
+        );
+        let mut stroke_ids = Vec::new();
+        for cell in spatial_cells {
+            if let Some(ids) = self.tile_cache.stroke_ids_by_cell.get(&cell) {
+                stroke_ids.extend(ids.iter().copied());
+            }
+        }
+        stroke_ids.sort_unstable();
+        stroke_ids.dedup();
+
+        if stroke_ids.is_empty() {
+            // Empty tiles are just the canvas background; do not allocate them.
             return;
-        };
-        let raster_scale = self.tile_cache.raster_scale;
+        }
+
         let mut pixmap = Pixmap::new(TILE_BITMAP_SIZE, TILE_BITMAP_SIZE)
             .expect("failed to allocate canvas tile pixmap");
         pixmap.fill(Color::from_rgba8(0, 0, 0, 255));
-
         let transform = tile_transform(coord, raster_scale);
 
         for stroke_id in stroke_ids {
@@ -1072,7 +1052,7 @@ impl MathCanvasApp {
         }
 
         self.tile_cache.rendered_tiles.insert(
-            coord,
+            key,
             CachedTile {
                 pixmap,
                 last_used: use_stamp,
@@ -1080,8 +1060,7 @@ impl MathCanvasApp {
         );
     }
 
-    fn tile_coords_for_screen_rect(&self, rect: PixelRect) -> Vec<TileCoord> {
-        let world_size = self.tile_cache.world_size;
+    fn tile_coords_for_screen_rect(&self, rect: PixelRect, world_size: f32) -> Vec<TileCoord> {
         let zoom = self.zoom;
         let first_x = (rect.x0 as f32 + 0.5 - self.pan[0]) / zoom;
         let first_y = (rect.y0 as f32 + 0.5 - self.pan[1]) / zoom;
@@ -1102,10 +1081,7 @@ impl MathCanvasApp {
         coords
     }
 
-    fn evict_old_tiles(&mut self, visible: &HashSet<TileCoord>) {
-        // All cached tiles use the same RGBA8 dimensions, so the current cache
-        // footprint can be calculated cheaply without tracking bytes on every
-        // insertion/removal path.
+    fn evict_old_tiles(&mut self, visible: &HashSet<RasterTileKey>) {
         let mut cached_bytes = self.tile_cache.rendered_tiles.len() * TILE_BITMAP_BYTES;
 
         while cached_bytes > MAX_TILE_CACHE_BYTES {
@@ -1113,16 +1089,15 @@ impl MathCanvasApp {
                 .tile_cache
                 .rendered_tiles
                 .iter()
-                .filter(|(coord, _)| !visible.contains(*coord))
+                .filter(|(key, _)| !visible.contains(*key))
                 .min_by_key(|(_, tile)| tile.last_used)
-                .map(|(coord, _)| *coord);
-            let Some(coord) = oldest else {
-                // Keep all visible tiles even if the viewport alone exceeds
-                // the nominal memory budget. The budget is a soft cap, not a
-                // reason to evict content needed to display the current view.
+                .map(|(key, _)| *key);
+            let Some(key) = oldest else {
+                // Keep all tiles needed for the current viewport, even if the
+                // visible set alone temporarily exceeds the soft memory cap.
                 break;
             };
-            if self.tile_cache.rendered_tiles.remove(&coord).is_some() {
+            if self.tile_cache.rendered_tiles.remove(&key).is_some() {
                 cached_bytes = cached_bytes.saturating_sub(TILE_BITMAP_BYTES);
             }
         }
@@ -1133,66 +1108,44 @@ impl MathCanvasApp {
     // implicit background and therefore consume no cached raster memory.
 
     fn composite_tiles_into_frame(&mut self, rect: PixelRect) {
-        self.ensure_tile_index_current();
+        self.ensure_spatial_index_current();
 
-        let visible_coords = self.tile_coords_for_screen_rect(rect);
+        let level = tile_zoom_level(self.zoom);
+        let raster_scale = Self::raster_scale_for_level(level);
+        let tile_world_size = TILE_SIZE_PX as f32 / raster_scale;
+        let visible_coords = self.tile_coords_for_screen_rect(rect, tile_world_size);
 
         for coord in &visible_coords {
-            self.ensure_tile_rendered(*coord);
+            self.ensure_tile_rendered(level, *coord);
         }
 
-        let tile_world_size = self.tile_cache.world_size;
-        let raster_scale = self.tile_cache.raster_scale;
         let zoom = self.zoom;
         let pan = self.pan;
-
-        let invert_contrast = self.invert_contrast;
-
-        let packed_background = if invert_contrast { RGB_INVERT_MASK } else { 0 };
-
-        // Ensure the packed framebuffer matches the viewport dimensions.
         let frame_size = self
             .frame_pixmap
             .as_ref()
             .map(|frame| (frame.width() as usize, frame.height() as usize));
-
-        if let Some((width, height)) = frame_size {
-            self.packed_frame.resize(width * height, packed_background);
-        }
-
-        // Reuse horizontal sampling coordinates across all tiles.
         let mut x_samples = Vec::new();
 
-        if let (Some(destination), Some((width, _))) = (self.frame_pixmap.as_mut(), frame_size)
-        {
-            let packed_frame = &mut self.packed_frame;
-
-            // Clear both framebuffer representations.
+        if let (Some(destination), Some((width, _))) = (self.frame_pixmap.as_mut(), frame_size) {
+            // Clear the damaged area to the canonical (non-inverted) background.
             {
                 let destination_data = destination.data_mut();
-
                 const BACKGROUND_RGBA: [u8; 4] = [0, 0, 0, 255];
-
                 for y in rect.y0 as usize..rect.y1 as usize {
                     let pixel_start = y * width + rect.x0 as usize;
                     let pixel_end = y * width + rect.x1 as usize;
-
                     let byte_start = pixel_start * 4;
                     let byte_end = pixel_end * 4;
-
-                    // Clear RGBA framebuffer.
                     for pixel in destination_data[byte_start..byte_end].chunks_exact_mut(4) {
                         pixel.copy_from_slice(&BACKGROUND_RGBA);
                     }
-
-                    // Clear packed framebuffer.
-                    packed_frame[pixel_start..pixel_end].fill(packed_background);
                 }
             }
 
-            // Composite visible tiles into both framebuffers simultaneously.
             for coord in &visible_coords {
-                if let Some(tile) = self.tile_cache.rendered_tiles.get(coord) {
+                let key = RasterTileKey { level, coord: *coord };
+                if let Some(tile) = self.tile_cache.rendered_tiles.get(&key) {
                     composite_tile_region(
                         destination,
                         &tile.pixmap,
@@ -1203,29 +1156,34 @@ impl MathCanvasApp {
                         zoom,
                         pan,
                         &mut x_samples,
-                        packed_frame,
-                        invert_contrast,
                     );
                 }
             }
         }
 
-        // Both framebuffers have now been updated.
-        // Tell the presentation system which region changed.
         if frame_size.is_some() {
             self.add_pending_damage(rect);
         }
 
-        // Calculate all tiles currently visible in the viewport.
+        // Protect the current viewport's keys while evicting the least-recently
+        // used cached rasters from any other zoom level.
         let viewport = self
             .frame_pixmap
             .as_ref()
             .map(|pixmap| PixelRect::full(pixmap.width(), pixmap.height()));
-
-        let visible_set: HashSet<TileCoord> = viewport
-            .map(|full| self.tile_coords_for_screen_rect(full).into_iter().collect())
-            .unwrap_or_else(|| visible_coords.into_iter().collect());
-
+        let visible_set: HashSet<RasterTileKey> = viewport
+            .map(|full| {
+                self.tile_coords_for_screen_rect(full, tile_world_size)
+                    .into_iter()
+                    .map(|coord| RasterTileKey { level, coord })
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                visible_coords
+                    .into_iter()
+                    .map(|coord| RasterTileKey { level, coord })
+                    .collect()
+            });
         self.evict_old_tiles(&visible_set);
     }
 
@@ -1236,209 +1194,113 @@ impl MathCanvasApp {
         );
     }
 
-    fn update_packed_region_from_frame(&mut self, rect: PixelRect) {
-        let Some(frame) = self.frame_pixmap.as_ref() else {
-            return;
-        };
-
-        let width = frame.width() as usize;
-        let data = frame.data();
-        let invert = self.invert_contrast;
-        let packed = &mut self.packed_frame;
-
-        // Process contiguous row slices to avoid per-pixel index arithmetic.
-        for y in rect.y0 as usize..rect.y1 as usize {
-            let pixel_start = y * width + rect.x0 as usize;
-            let pixel_end = y * width + rect.x1 as usize;
-            let source_start = pixel_start * 4;
-            let source_end = pixel_end * 4;
-
-            let dst_row = &mut packed[pixel_start..pixel_end];
-            let src_row = data[source_start..source_end].chunks_exact(4);
-
-            for (dst, src) in dst_row.iter_mut().zip(src_row) {
-                let pixel = ((src[0] as u32) << 16) | ((src[1] as u32) << 8) | (src[2] as u32);
-
-                *dst = if invert {
-                    pixel ^ RGB_INVERT_MASK
-                } else {
-                    pixel
-                };
-            }
-        }
-
-        self.add_pending_damage(rect);
-    }
-
     fn render_pan_frame(&mut self) {
-        let background = if self.invert_contrast {
-            BACKGROUND_PIXEL ^ RGB_INVERT_MASK
-        } else {
-            BACKGROUND_PIXEL
-        };
-
+        let invert = self.invert_contrast;
+        let background = if invert { RGB_INVERT_MASK } else { 0 };
         let [dx, dy] = self.pan_preview_offset;
 
         let Some(frame) = self.frame_pixmap.as_ref() else {
             return;
         };
-
         let width = frame.width() as usize;
         let height = frame.height() as usize;
-
-        let Some(source) = self.pan_source_frame.as_ref() else {
-            return;
-        };
-
-        if source.len() != width * height {
-            return;
-        }
+        let source = frame.data();
 
         let Some(surface) = self.surface.as_mut() else {
             return;
         };
-
         let Ok(mut buffer) = surface.buffer_mut() else {
             return;
         };
-
         if buffer.len() != width * height {
             return;
         }
 
         let dx = dx as i64;
         let dy = dy as i64;
-
         for y in 0..height {
             let source_y = y as i64 - dy;
-
-            let row_start = y * width;
-            let destination_row = &mut buffer[row_start..row_start + width];
-
-            // This destination row has moved outside the source image.
+            let destination_row = &mut buffer[y * width..(y + 1) * width];
             if source_y < 0 || source_y >= height as i64 {
                 destination_row.fill(background);
                 continue;
             }
 
-            let source_start = source_y as usize * width;
-            let source_row = &source[source_start..source_start + width];
-
-            // Shift the source row horizontally using bulk memory copies.
-            if dx > 0 {
-                let shift = dx as usize;
-
-                if shift >= width {
-                    destination_row.fill(background);
-                } else {
-                    destination_row[..shift].fill(background);
-
-                    destination_row[shift..].copy_from_slice(&source_row[..width - shift]);
+            let source_row_start = source_y as usize * width * 4;
+            for (x, destination_pixel) in destination_row.iter_mut().enumerate() {
+                let source_x = x as i64 - dx;
+                if source_x < 0 || source_x >= width as i64 {
+                    *destination_pixel = background;
+                    continue;
                 }
-            } else if dx < 0 {
-                let shift = (-dx) as usize;
 
-                if shift >= width {
-                    destination_row.fill(background);
-                } else {
-                    destination_row[..width - shift].copy_from_slice(&source_row[shift..]);
-
-                    destination_row[width - shift..].fill(background);
-                }
-            } else {
-                destination_row.copy_from_slice(source_row);
+                let source_index = source_row_start + source_x as usize * 4;
+                let pixel = ((source[source_index] as u32) << 16)
+                    | ((source[source_index + 1] as u32) << 8)
+                    | source[source_index + 2] as u32;
+                *destination_pixel = if invert { pixel ^ RGB_INVERT_MASK } else { pixel };
             }
         }
 
         let _ = buffer.present();
-
-        // Panning changes the entire presented image.
-        // The next normal presentation must start with a full update.
         self.damage_history.clear();
         self.pending_damage = Some(PixelRect::full(width as u32, height as u32));
     }
 
     fn render_zoom_frame(&mut self) {
-        let background = if self.invert_contrast {
-            BACKGROUND_PIXEL ^ RGB_INVERT_MASK
-        } else {
-            BACKGROUND_PIXEL
-        };
-
+        let invert = self.invert_contrast;
+        let background = if invert { RGB_INVERT_MASK } else { 0 };
         let zoom = self.zoom;
         let pan = self.pan;
-
         let zoom_origin = self.zoom_origin;
         let pan_origin = self.zoom_pan_origin;
-
-        let Some(source) = self.zoom_source_frame.as_ref() else {
-            return;
-        };
 
         let Some(frame) = self.frame_pixmap.as_ref() else {
             return;
         };
-
         let width = frame.width() as usize;
         let height = frame.height() as usize;
-
-        if source.len() != width * height {
-            return;
-        }
+        let source = frame.data();
 
         let Some(surface) = self.surface.as_mut() else {
             return;
         };
-
         let Ok(mut buffer) = surface.buffer_mut() else {
             return;
         };
-
         if buffer.len() != width * height {
             return;
         }
 
-        // How many source pixels correspond to one destination pixel.
         let scale = zoom_origin / zoom;
-
         for y in 0..height {
-            // Map this destination row back into the original bitmap.
             let source_y = ((y as f32 - pan[1]) * scale + pan_origin[1]).round() as i32;
-
-            let row_start = y * width;
-            let destination_row = &mut buffer[row_start..row_start + width];
-
+            let destination_row = &mut buffer[y * width..(y + 1) * width];
             if source_y < 0 || source_y >= height as i32 {
                 destination_row.fill(background);
                 continue;
             }
 
-            let source_row_start = source_y as usize * width;
-
-            // Calculate the initial source X coordinate.
+            let source_row_start = source_y as usize * width * 4;
             let mut source_x = (0.0 - pan[0]) * scale + pan_origin[0];
-
-            for x in 0..width {
+            for destination_pixel in destination_row.iter_mut() {
                 let sx = source_x.round() as i32;
-
                 if sx < 0 || sx >= width as i32 {
-                    destination_row[x] = background;
+                    *destination_pixel = background;
                 } else {
-                    destination_row[x] = source[source_row_start + sx as usize];
+                    let source_index = source_row_start + sx as usize * 4;
+                    let pixel = ((source[source_index] as u32) << 16)
+                        | ((source[source_index + 1] as u32) << 8)
+                        | source[source_index + 2] as u32;
+                    *destination_pixel = if invert { pixel ^ RGB_INVERT_MASK } else { pixel };
                 }
-
-                // Move to the next source pixel.
                 source_x += scale;
             }
         }
 
         let result = buffer.present();
-
         if result.is_ok() {
-            // The entire visible image was updated.
-            // Record that fact for subsequent buffer-age calculations.
             let full = PixelRect::full(width as u32, height as u32);
-
             self.damage_history.clear();
             self.damage_history.push_back(Some(full));
             self.pending_damage = None;
@@ -1451,7 +1313,6 @@ impl MathCanvasApp {
         }
 
         self.is_zooming = false;
-        self.zoom_source_frame = None;
         self.zoom_settle_deadline = None;
 
         self.cache_dirty = true;
@@ -1574,22 +1435,18 @@ impl MathCanvasApp {
         let flatness_tolerance = ERASER_FLATNESS_PX / self.zoom;
 
         // Query only spatial cells intersected by the swept eraser capsule.
-        self.ensure_tile_index_current();
+        self.ensure_spatial_index_current();
         let query_bounds = [
             from[0].min(to[0]) - eraser_radius,
             from[1].min(to[1]) - eraser_radius,
             from[0].max(to[0]) + eraser_radius,
             from[1].max(to[1]) + eraser_radius,
         ];
-        let query_tiles = tile_coords_for_bounds(
-            query_bounds,
-            self.tile_cache.world_size,
-            TILE_GUTTER_PX as f32 / self.tile_cache.raster_scale,
-        );
+        let query_tiles = tile_coords_for_bounds(query_bounds, SPATIAL_CELL_WORLD_SIZE, 0.0);
 
         let mut candidate_ids = Vec::new();
         for coord in query_tiles {
-            if let Some(ids) = self.tile_cache.stroke_ids_by_tile.get(&coord) {
+            if let Some(ids) = self.tile_cache.stroke_ids_by_cell.get(&coord) {
                 candidate_ids.extend(ids.iter().copied());
             }
         }
@@ -1632,7 +1489,7 @@ impl MathCanvasApp {
             .zip(old_ids.into_iter())
         {
             if removed_ids.contains(&stroke_id) {
-                self.unregister_stroke_from_tiles(stroke_id);
+                self.unregister_stroke_from_tiles(stroke_id, stroke.bounds);
             } else {
                 self.strokes.push(stroke);
                 self.stroke_cache.paths.push(path);
@@ -1737,42 +1594,18 @@ impl MathCanvasApp {
         // The frame pixmap now represents the current camera position.
         self.pan_origin = self.pan;
         self.pan_preview_offset = [0, 0];
-        self.pan_source_frame = None;
     }
 
     fn toggle_invert_contrast(&mut self, event_loop: &dyn ActiveEventLoop) {
         self.invert_contrast = !self.invert_contrast;
 
-        // Invert the already-packed framebuffer in place.
-        for pixel in &mut self.packed_frame {
-            *pixel ^= RGB_INVERT_MASK;
-        }
-
-        // Keep temporary pan and zoom snapshots in sync.
-        if let Some(source) = self.pan_source_frame.as_mut() {
-            for pixel in source {
-                *pixel ^= RGB_INVERT_MASK;
-            }
-        }
-
-        if let Some(source) = self.zoom_source_frame.as_mut() {
-            for pixel in source {
-                *pixel ^= RGB_INVERT_MASK;
-            }
-        }
-
-        // Every pixel has changed.
+        // The canonical pixmap remains unchanged; inversion is applied while
+        // copying pixels into softbuffer. Mark the whole presentation dirty.
         if let Some(frame) = &self.frame_pixmap {
             self.pending_damage = Some(PixelRect::full(frame.width(), frame.height()));
         }
-
-        // Previous buffer damage history is no longer useful.
         self.damage_history.clear();
-
-        // Update the native brush cursor to remain visible.
         self.update_brush_cursor(event_loop);
-
-        // Request one redraw.
         if let Some(win) = &self.window {
             win.request_redraw();
         }
@@ -1788,38 +1621,30 @@ impl MathCanvasApp {
             return;
         }
 
+        let invert = self.invert_contrast;
         let (Some(surface), Some(frame)) = (self.surface.as_mut(), self.frame_pixmap.as_ref())
         else {
             return;
         };
-
         let width = frame.width() as usize;
         let height = frame.height() as usize;
+        let source = frame.data();
 
         let Ok(mut buffer) = surface.buffer_mut() else {
             return;
         };
-
         debug_assert_eq!(buffer.len(), width * height);
 
-        // Determine how old this presentation buffer is.
         let age = buffer.age() as usize;
-
         let full_rect = PixelRect::full(width as u32, height as u32);
-
         let previous_frames_needed = age.saturating_sub(1);
-
-        // If the buffer has never been presented, or we don't have
-        // enough damage history, we must refresh the entire buffer.
         let needs_full_copy = age == 0 || previous_frames_needed > self.damage_history.len();
-
         let mut update_rect = if needs_full_copy {
             Some(full_rect)
         } else {
             self.pending_damage
         };
 
-        // Include changes made since this buffer was last presented.
         if !needs_full_copy {
             for previous_damage in self
                 .damage_history
@@ -1834,37 +1659,44 @@ impl MathCanvasApp {
             }
         }
 
-        // Nothing changed, and this buffer already contains the latest frame.
         let Some(rect) = update_rect else {
             return;
         };
 
-        // Copy only the required rows from our packed framebuffer.
-        for y in rect.y0..rect.y1 {
-            let start = y as usize * width + rect.x0 as usize;
-            let end = y as usize * width + rect.x1 as usize;
+        // Convert only damaged RGBA pixels to softbuffer's 0x00RRGGBB format.
+        // The Pixmap is the sole canonical framebuffer; contrast inversion is
+        // a presentation transform and never mutates cached or source pixels.
+        for y in rect.y0 as usize..rect.y1 as usize {
+            let pixel_start = y * width + rect.x0 as usize;
+            let pixel_end = y * width + rect.x1 as usize;
+            let source_start = pixel_start * 4;
+            let source_end = pixel_end * 4;
+            let source_row = &source[source_start..source_end];
+            let destination_row = &mut buffer[pixel_start..pixel_end];
 
-            buffer[start..end].copy_from_slice(&self.packed_frame[start..end]);
+            for (destination_pixel, rgba) in destination_row
+                .iter_mut()
+                .zip(source_row.chunks_exact(4))
+            {
+                let pixel = ((rgba[0] as u32) << 16)
+                    | ((rgba[1] as u32) << 8)
+                    | rgba[2] as u32;
+                *destination_pixel = if invert { pixel ^ RGB_INVERT_MASK } else { pixel };
+            }
         }
 
         let damage = rect.to_softbuffer_rect();
         let current_damage = self.pending_damage;
-
-        // Let the backend know which region changed.
         let result = buffer.present_with_damage(&[damage]);
-
         if result.is_ok() {
-            // Store the actual scene changes from this frame.
             self.damage_history.push_back(current_damage);
-
-            // Buffer ages are normally small. Keep a little extra history.
             if self.damage_history.len() > 8 {
                 self.damage_history.pop_front();
             }
-
             self.pending_damage = None;
         }
     }
+
 }
 impl ApplicationHandler for MathCanvasApp {
     fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
@@ -1908,8 +1740,7 @@ impl ApplicationHandler for MathCanvasApp {
 
         if zoom_finished {
             self.is_zooming = false;
-            self.zoom_source_frame = None;
-            self.zoom_settle_deadline = None;
+                self.zoom_settle_deadline = None;
 
             // Now we need a proper vector rendering at the final zoom.
             self.cache_dirty = true;
@@ -1988,7 +1819,6 @@ impl ApplicationHandler for MathCanvasApp {
                     }
                     // Cancel temporary zoom state; the viewport dimensions have changed.
                     self.is_zooming = false;
-                    self.zoom_source_frame = None;
                     self.zoom_settle_deadline = None;
 
                     self.redraw_pending = false;
@@ -1996,7 +1826,6 @@ impl ApplicationHandler for MathCanvasApp {
 
                     // Cancel temporary panning state.
                     self.is_panning = false;
-                    self.pan_source_frame = None;
                     self.pan_preview_offset = [0, 0];
                     self.pan_origin = self.pan;
 
@@ -2038,7 +1867,7 @@ impl ApplicationHandler for MathCanvasApp {
                             let removed_path = self.stroke_cache.paths.pop();
                             debug_assert!(removed_path.is_some());
                             if let Some(stroke_id) = self.stroke_ids.pop() {
-                                self.unregister_stroke_from_tiles(stroke_id);
+                                self.unregister_stroke_from_tiles(stroke_id, removed_stroke.bounds);
                             }
                             self.rebuild_stroke_id_to_index();
                             if let Some(damage) =
@@ -2193,8 +2022,6 @@ impl ApplicationHandler for MathCanvasApp {
                         self.pan_origin = self.pan;
                         self.pan_preview_offset = [0, 0];
 
-                        // Preserve the original image for the entire pan gesture.
-                        self.pan_source_frame = Some(self.packed_frame.clone());
                     }
                     ElementState::Released if self.is_panning => {
                         self.is_panning = false;
@@ -2268,13 +2095,12 @@ impl ApplicationHandler for MathCanvasApp {
                     return;
                 }
 
-                // Capture the original image only once, on the first wheel event.
+                // Keep the original camera transform for the entire wheel gesture;
+                // preview frames sample the unchanged canonical Pixmap directly.
                 if !self.is_zooming {
                     self.ensure_frame_current();
 
                     self.is_zooming = true;
-
-                    self.zoom_source_frame = Some(self.packed_frame.clone());
 
                     self.zoom_origin = self.zoom;
                     self.zoom_pan_origin = self.pan;
@@ -2326,7 +2152,7 @@ impl ApplicationHandler for MathCanvasApp {
 
                 if self.is_drawing {
                     if let Some(damage) = self.draw_pending_preview_segments() {
-                        self.update_packed_region_from_frame(damage);
+                        self.add_pending_damage(damage);
                     }
                 }
 
