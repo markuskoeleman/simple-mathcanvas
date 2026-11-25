@@ -206,17 +206,6 @@ impl VectorStroke {
     }
 }
 
-// --- Runtime Rendering Cache ---
-//
-// Stores generated tiny-skia paths separately from the document geometry.
-// Paths are generated once when strokes are committed and reused during
-// subsequent cache rebuilds. This data is temporary and never serialized.
-
-#[derive(Default)]
-struct StrokeRenderCache {
-    paths: Vec<Path>,
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct TileCoord {
     x: i32,
@@ -572,9 +561,25 @@ fn cubic_touched_by_eraser(
     eraser_from: [f32; 2],
     eraser_to: [f32; 2],
     hit_radius: f32,
+    capsule_bounds: [f32; 4],
     flatness_tolerance: f32,
     depth: u32,
 ) -> bool {
+    // A cubic Bézier curve lies inside the convex hull of its control points.
+    // If that control-point AABB misses the swept eraser capsule's AABB, this
+    // entire curve segment can be rejected before flatness/subdivision work.
+    let min_x = p0[0].min(p1[0]).min(p2[0]).min(p3[0]);
+    let min_y = p0[1].min(p1[1]).min(p2[1]).min(p3[1]);
+    let max_x = p0[0].max(p1[0]).max(p2[0]).max(p3[0]);
+    let max_y = p0[1].max(p1[1]).max(p2[1]).max(p3[1]);
+    if max_x < capsule_bounds[0]
+        || min_x > capsule_bounds[2]
+        || max_y < capsule_bounds[1]
+        || min_y > capsule_bounds[3]
+    {
+        return false;
+    }
+
     // Measure how far the control points deviate from
     // the straight line connecting the curve's endpoints.
     let deviation_sq = point_to_segment_distance_squared(p1, p0, p3)
@@ -611,6 +616,7 @@ fn cubic_touched_by_eraser(
         eraser_from,
         eraser_to,
         hit_radius,
+        capsule_bounds,
         flatness_tolerance,
         depth + 1,
     ) {
@@ -626,6 +632,7 @@ fn cubic_touched_by_eraser(
         eraser_from,
         eraser_to,
         hit_radius,
+        capsule_bounds,
         flatness_tolerance,
         depth + 1,
     )
@@ -640,7 +647,8 @@ fn stroke_touched_by_eraser(
 ) -> bool {
     let hit_radius = eraser_radius + stroke.width * 0.5;
 
-    // Broad-phase bounding-box rejection.
+    // Broad-phase stroke rejection. The stored stroke bounds include brush
+    // padding; the capsule uses the eraser's centreline radius here.
     let min_x = from[0].min(to[0]) - eraser_radius;
     let min_y = from[1].min(to[1]) - eraser_radius;
     let max_x = from[0].max(to[0]) + eraser_radius;
@@ -654,6 +662,15 @@ fn stroke_touched_by_eraser(
         return false;
     }
 
+    // Inflate by the complete hit radius, including half the stroke width.
+    // This is computed once per stroke/eraser query and reused for every cubic.
+    let capsule_bounds = [
+        from[0].min(to[0]) - hit_radius,
+        from[1].min(to[1]) - hit_radius,
+        from[0].max(to[0]) + hit_radius,
+        from[1].max(to[1]) + hit_radius,
+    ];
+
     let mut curve_start = stroke.start;
 
     for segment in &stroke.segments {
@@ -665,6 +682,7 @@ fn stroke_touched_by_eraser(
             from,
             to,
             hit_radius,
+            capsule_bounds,
             flatness_tolerance,
             0,
         ) {
@@ -890,29 +908,33 @@ impl Default for Interaction {
 #[derive(Default)]
 struct SpatialIndex {
     built: bool,
-    stroke_ids_by_cell: HashMap<TileCoord, Vec<u64>>,
-    cells_by_stroke: HashMap<u64, Vec<TileCoord>>,
+    stroke_ids_by_cell: HashMap<TileCoord, Vec<usize>>,
+    cells_by_stroke: HashMap<usize, Vec<TileCoord>>,
+}
+
+// Geometry and its prebuilt tiny-skia path share one stable document slot.
+// Empty slots are tombstones: IDs are their indices and are never reused.
+struct StrokeEntry {
+    stroke: VectorStroke,
+    path: Path,
 }
 
 struct Document {
-    strokes: Vec<VectorStroke>,
-    stroke_cache: StrokeRenderCache,
-    stroke_ids: Vec<u64>,
-    stroke_id_to_index: HashMap<u64, usize>,
-    next_stroke_id: u64,
+    // Insertion order is draw order. Tombstones preserve stable IDs and z-order.
+    // Slots are not reused or compacted in-memory; a future save path should
+    // serialize only live entries and assign compact IDs when loading.
+    entries: Vec<Option<StrokeEntry>>,
+    last_live_id: Option<usize>,
     spatial_index: SpatialIndex,
     query_cells: Vec<TileCoord>,
-    query_stroke_ids: Vec<u64>,
+    query_stroke_ids: Vec<usize>,
 }
 
 impl Default for Document {
     fn default() -> Self {
         Self {
-            strokes: Vec::new(),
-            stroke_cache: StrokeRenderCache::default(),
-            stroke_ids: Vec::new(),
-            stroke_id_to_index: HashMap::new(),
-            next_stroke_id: 1,
+            entries: Vec::new(),
+            last_live_id: None,
             spatial_index: SpatialIndex::default(),
             query_cells: Vec::new(),
             query_stroke_ids: Vec::new(),
@@ -921,23 +943,15 @@ impl Default for Document {
 }
 
 impl Document {
-    fn rebuild_stroke_id_to_index(&mut self) {
-        self.stroke_id_to_index.clear();
-        self.stroke_id_to_index.reserve(self.stroke_ids.len());
-        for (index, stroke_id) in self.stroke_ids.iter().copied().enumerate() {
-            self.stroke_id_to_index.insert(stroke_id, index);
-        }
-    }
-
     fn ensure_spatial_index_current(&mut self) {
         if self.spatial_index.built {
             return;
         }
         self.spatial_index.stroke_ids_by_cell.clear();
         self.spatial_index.cells_by_stroke.clear();
-        for (index, stroke) in self.strokes.iter().enumerate() {
-            let Some(&stroke_id) = self.stroke_ids.get(index) else { continue; };
-            let cells = tile_coords_for_bounds(stroke.bounds, SPATIAL_CELL_WORLD_SIZE, 0.0);
+        for (stroke_id, entry) in self.entries.iter().enumerate() {
+            let Some(entry) = entry.as_ref() else { continue; };
+            let cells = tile_coords_for_bounds(entry.stroke.bounds, SPATIAL_CELL_WORLD_SIZE, 0.0);
             for cell in &cells {
                 self.spatial_index.stroke_ids_by_cell.entry(*cell).or_default().push(stroke_id);
             }
@@ -946,21 +960,20 @@ impl Document {
         self.spatial_index.built = true;
     }
 
-    fn append_stroke(&mut self, stroke: VectorStroke, path: Path) -> (u64, [f32; 4]) {
+    fn append_stroke(&mut self, stroke: VectorStroke, path: Path) -> (usize, [f32; 4]) {
         let bounds = stroke.bounds;
-        let stroke_id = self.next_stroke_id;
-        self.next_stroke_id = self.next_stroke_id.wrapping_add(1).max(1);
-        self.strokes.push(stroke);
-        self.stroke_cache.paths.push(path);
-        self.stroke_ids.push(stroke_id);
-        self.stroke_id_to_index.insert(stroke_id, self.strokes.len() - 1);
+        let stroke_id = self.entries.len();
+        self.entries.push(Some(StrokeEntry { stroke, path }));
+        self.last_live_id = Some(stroke_id);
         self.add_stroke_to_spatial_index(stroke_id, bounds);
         (stroke_id, bounds)
     }
 
-    fn add_stroke_to_spatial_index(&mut self, stroke_id: u64, bounds: [f32; 4]) {
+    fn add_stroke_to_spatial_index(&mut self, stroke_id: usize, bounds: [f32; 4]) {
         self.ensure_spatial_index_current();
-        if self.spatial_index.cells_by_stroke.contains_key(&stroke_id) { return; }
+        if self.spatial_index.cells_by_stroke.contains_key(&stroke_id) {
+            return;
+        }
         let cells = tile_coords_for_bounds(bounds, SPATIAL_CELL_WORLD_SIZE, 0.0);
         for cell in &cells {
             self.spatial_index.stroke_ids_by_cell.entry(*cell).or_default().push(stroke_id);
@@ -968,34 +981,35 @@ impl Document {
         self.spatial_index.cells_by_stroke.insert(stroke_id, cells);
     }
 
-    fn remove_stroke_from_spatial_index(&mut self, stroke_id: u64) {
+    fn remove_stroke_from_spatial_index(&mut self, stroke_id: usize) {
         if let Some(cells) = self.spatial_index.cells_by_stroke.remove(&stroke_id) {
             for cell in cells {
                 let remove_entry = if let Some(ids) = self.spatial_index.stroke_ids_by_cell.get_mut(&cell) {
                     ids.retain(|id| *id != stroke_id);
                     ids.is_empty()
-                } else { false };
-                if remove_entry { self.spatial_index.stroke_ids_by_cell.remove(&cell); }
+                } else {
+                    false
+                };
+                if remove_entry {
+                    self.spatial_index.stroke_ids_by_cell.remove(&cell);
+                }
             }
         }
-        self.stroke_id_to_index.remove(&stroke_id);
     }
 
-    fn stroke_render_data(&self, stroke_id: u64) -> Option<(&VectorStroke, &Path)> {
-        let index = *self.stroke_id_to_index.get(&stroke_id)?;
-        Some((self.strokes.get(index)?, self.stroke_cache.paths.get(index)?))
+    fn stroke_render_data(&self, stroke_id: usize) -> Option<(&VectorStroke, &Path)> {
+        let entry = self.entries.get(stroke_id)?.as_ref()?;
+        Some((&entry.stroke, &entry.path))
     }
 
-    // Visit matching strokes while the reusable query buffers remain owned by
-    // the document. Returning a slice into `self` would keep a mutable borrow
-    // alive while callers tried to look up each stroke immutably (E0502).
-    // The callback keeps the query allocation reusable without cloning IDs.
+    // The spatial index returns IDs in arbitrary cell order; sorting the stable
+    // slot indices restores document/z order without a separate ID->index map.
     fn for_each_stroke_render_data_intersecting<F>(
         &mut self,
         bounds: [f32; 4],
         mut visit: F,
     ) where
-        F: FnMut(u64, &VectorStroke, &Path),
+        F: FnMut(usize, &VectorStroke, &Path),
     {
         self.ensure_spatial_index_current();
         self.query_cells.clear();
@@ -1011,71 +1025,53 @@ impl Document {
         self.query_stroke_ids.sort_unstable();
         self.query_stroke_ids.dedup();
 
-        // Copy the ID before borrowing the parallel document arrays. The
-        // callback receives references only for this iteration and cannot
-        // retain them beyond the call.
         for index_in_query in 0..self.query_stroke_ids.len() {
             let stroke_id = self.query_stroke_ids[index_in_query];
-            let Some(index) = self.stroke_id_to_index.get(&stroke_id).copied() else {
+            let Some(entry) = self.entries.get(stroke_id).and_then(Option::as_ref) else {
                 continue;
             };
-            let (Some(stroke), Some(path)) = (
-                self.strokes.get(index),
-                self.stroke_cache.paths.get(index),
-            ) else {
-                continue;
-            };
-            visit(stroke_id, stroke, path);
+            visit(stroke_id, &entry.stroke, &entry.path);
         }
     }
 
+    // Undo removes the newest live stroke. `last_live_id` avoids repeatedly
+    // scanning a long tail of tombstones while preserving stable slot IDs.
     fn pop_last_stroke(&mut self) -> Option<VectorStroke> {
-        if self.strokes.is_empty() {
-            return None;
-        }
-        debug_assert_eq!(self.strokes.len(), self.stroke_cache.paths.len());
-        debug_assert_eq!(self.strokes.len(), self.stroke_ids.len());
-
-        let stroke = self.strokes.pop().expect("checked non-empty document");
-        let _path = self.stroke_cache.paths.pop();
-        let stroke_id = self.stroke_ids.pop().expect("parallel stroke ID missing");
+        let stroke_id = self.last_live_id?;
+        let entry = self.entries.get_mut(stroke_id)?.take()?;
         self.remove_stroke_from_spatial_index(stroke_id);
-        self.rebuild_stroke_id_to_index();
-        Some(stroke)
+        self.last_live_id = self.entries[..stroke_id].iter().rposition(Option::is_some);
+        Some(entry.stroke)
     }
 
-    // Remove several strokes in one compaction pass. The document owns all
-    // parallel arrays and keeps the spatial index and ID lookup coherent.
-    fn remove_strokes(&mut self, removed_ids: &HashSet<u64>) -> Vec<VectorStroke> {
-        debug_assert_eq!(self.strokes.len(), self.stroke_cache.paths.len());
-        debug_assert_eq!(self.strokes.len(), self.stroke_ids.len());
+    // Erasure takes only the hit entries. No document-wide vector compaction or
+    // hash-map rebuild occurs; removed geometry and paths are dropped immediately.
+    fn remove_strokes(&mut self, removed_ids: &HashSet<usize>) -> Vec<VectorStroke> {
         if removed_ids.is_empty() {
             return Vec::new();
         }
 
-        let old_strokes = std::mem::take(&mut self.strokes);
-        let old_paths = std::mem::take(&mut self.stroke_cache.paths);
-        let old_ids = std::mem::take(&mut self.stroke_ids);
-        self.strokes = Vec::with_capacity(old_strokes.len().saturating_sub(removed_ids.len()));
-        self.stroke_cache.paths = Vec::with_capacity(old_paths.len().saturating_sub(removed_ids.len()));
-        self.stroke_ids = Vec::with_capacity(old_ids.len().saturating_sub(removed_ids.len()));
+        let previous_last_live_id = self.last_live_id;
+        let removed_last_live = previous_last_live_id
+            .is_some_and(|stroke_id| removed_ids.contains(&stroke_id));
 
         let mut removed = Vec::with_capacity(removed_ids.len());
-        for ((stroke, path), stroke_id) in old_strokes
-            .into_iter()
-            .zip(old_paths)
-            .zip(old_ids)
-        {
-            if removed_ids.contains(&stroke_id) {
-                self.remove_stroke_from_spatial_index(stroke_id);
-                removed.push(stroke);
+        for &stroke_id in removed_ids {
+            let Some(entry) = self.entries.get_mut(stroke_id).and_then(Option::take) else {
+                continue;
+            };
+            self.remove_stroke_from_spatial_index(stroke_id);
+            removed.push(entry.stroke);
+            // `entry.path` is intentionally dropped with the removed entry.
+        }
+
+        if removed_last_live {
+            if let Some(last_id) = previous_last_live_id {
+                self.last_live_id = self.entries[..last_id].iter().rposition(Option::is_some);
             } else {
-                self.strokes.push(stroke);
-                self.stroke_cache.paths.push(path);
-                self.stroke_ids.push(stroke_id);
+                self.last_live_id = None;
             }
         }
-        self.rebuild_stroke_id_to_index();
         removed
     }
 }
@@ -1292,7 +1288,7 @@ impl TileRenderer {
     fn append_stroke_to_cached_tiles(
         &mut self,
         document: &Document,
-        stroke_id: u64,
+        stroke_id: usize,
         bounds: [f32; 4],
         current_level: i32,
     ) {
@@ -1992,7 +1988,7 @@ impl Default for MathCanvasApp {
 }
 
 impl MathCanvasApp {
-    fn register_stroke_in_tiles(&mut self, stroke_id: u64, bounds: [f32; 4]) {
+    fn register_stroke_in_tiles(&mut self, stroke_id: usize, bounds: [f32; 4]) {
         // Document already indexed the stroke atomically when it was appended.
         let current_level = tile_zoom_level(self.camera.zoom);
         self.tile_renderer.append_stroke_to_cached_tiles(
@@ -2132,7 +2128,7 @@ impl MathCanvasApp {
             from[0].max(to[0]) + eraser_radius,
             from[1].max(to[1]) + eraser_radius,
         ];
-        let mut removed_ids = HashSet::new();
+        let mut removed_ids: HashSet<usize> = HashSet::new();
         let mut damages = Vec::new();
         {
             // Split the field borrows so the document can drive the query
