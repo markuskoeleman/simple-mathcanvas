@@ -254,6 +254,13 @@ fn tile_coords_for_bounds(bounds: [f32; 4], world_size: f32, gutter_world: f32) 
     coords
 }
 
+// Conservative axis-aligned bounds test used after the spatial-cell query.
+// Inclusive edges avoid rejecting strokes that only touch a tile's padded bounds.
+#[inline]
+fn bounds_overlap(a: [f32; 4], b: [f32; 4]) -> bool {
+    a[0] <= b[2] && a[2] >= b[0] && a[1] <= b[3] && a[3] >= b[1]
+}
+
 fn tile_transform(coord: TileCoord, raster_scale: f32) -> Transform {
     // World -> tile-local pixels. The gutter allows antialiasing to extend
     // across tile boundaries without creating visible seams.
@@ -720,6 +727,39 @@ fn add_damage_rect(rects: &mut Vec<PixelRect>, mut rect: PixelRect) {
     }
 }
 
+// Coalesce rectangles emitted along a stroke before inserting them into the
+// bounded damage set. Neighbouring segments are usually spatially adjacent,
+// so this keeps the expensive bounded-set merge work proportional to the
+// number of spatial runs rather than the number of raw stroke samples.
+fn coalesce_ordered<I>(rects: I, out: &mut Vec<PixelRect>)
+where
+    I: IntoIterator<Item = PixelRect>,
+{
+    let mut run: Option<PixelRect> = None;
+
+    for rect in rects {
+        run = Some(match run {
+            None => rect,
+            Some(current) => {
+                let union = current.union(rect);
+                let separate_area = current.area().saturating_add(rect.area());
+                let merge_limit = separate_area.saturating_add(separate_area / 2);
+
+                if union.area() <= merge_limit {
+                    union
+                } else {
+                    add_damage_rect(out, current);
+                    rect
+                }
+            }
+        });
+    }
+
+    if let Some(rect) = run {
+        add_damage_rect(out, rect);
+    }
+}
+
 // Gesture state is represented by one mutually-exclusive mode. Data that only
 // exists during a gesture lives in that variant, so impossible combinations
 // (for example drawing and panning simultaneously) cannot be represented.
@@ -1081,6 +1121,14 @@ impl TileRenderer {
         document.for_each_stroke_render_data_intersecting(
             tile_bounds,
             |_, stroke, path| {
+                // The spatial index is deliberately coarse: a tile query may
+                // return strokes from neighbouring cells that cannot touch the
+                // tile (including its raster gutter). Reject them before
+                // allocating the tile pixmap or paying tiny-skia's stroke cost.
+                if !bounds_overlap(stroke.bounds, tile_bounds) {
+                    return;
+                }
+
                 let tile_pixmap = pixmap.get_or_insert_with(|| {
                     let mut tile = Pixmap::new(TILE_BITMAP_SIZE, TILE_BITMAP_SIZE)
                         .expect("failed to allocate canvas tile pixmap");
@@ -1105,7 +1153,7 @@ impl TileRenderer {
         );
     }
     fn evict_old_tiles(&mut self, visible: &HashSet<RasterTileKey>) {
-        let cached_bytes = self.rendered_tiles.len() * TILE_BITMAP_BYTES;
+        let cached_bytes = self.rendered_tiles.len().saturating_mul(TILE_BITMAP_BYTES);
         if cached_bytes <= MAX_TILE_CACHE_BYTES {
             return;
         }
@@ -1148,30 +1196,55 @@ impl TileRenderer {
         }
     }
 
-    fn append_stroke_to_cached_tiles(&mut self, document: &Document, stroke_id: u64, bounds: [f32; 4]) {
+    fn tile_overlaps_bounds(key: RasterTileKey, bounds: [f32; 4]) -> bool {
+        let raster_scale = Self::raster_scale_for_level(key.level);
+        let world_size = TILE_SIZE_PX as f32 / raster_scale;
+        let gutter_world = TILE_GUTTER_PX as f32 / raster_scale;
+        let tile_left = key.coord.x as f32 * world_size - gutter_world;
+        let tile_top = key.coord.y as f32 * world_size - gutter_world;
+        let tile_right = (key.coord.x as f32 + 1.0) * world_size + gutter_world;
+        let tile_bottom = (key.coord.y as f32 + 1.0) * world_size + gutter_world;
+
+        !(tile_right < bounds[0]
+            || tile_left > bounds[2]
+            || tile_bottom < bounds[1]
+            || tile_top > bounds[3])
+    }
+
+    fn append_stroke_to_cached_tiles(
+        &mut self,
+        document: &Document,
+        stroke_id: u64,
+        bounds: [f32; 4],
+        current_level: i32,
+    ) {
         let Some((stroke, path)) = document.stroke_render_data(stroke_id) else { return; };
         let use_stamp = self.touch_clock();
+        let mut stale_tiles = Vec::new();
 
-        // Work level-by-level: calculate the stroke's affected coordinates
-        // once, then touch only matching entries through direct hash lookups.
-        self.collect_cached_levels();
-        for level in self.cached_levels.iter().copied() {
-            let raster_scale = Self::raster_scale_for_level(level);
-            let world_size = TILE_SIZE_PX as f32 / raster_scale;
-            let gutter_world = TILE_GUTTER_PX as f32 / raster_scale;
-            let affected_coords = tile_coords_for_bounds(bounds, world_size, gutter_world);
-
-            for coord in affected_coords {
-                let key = RasterTileKey { level, coord };
-                if let Some(tile) = self.rendered_tiles.get_mut(&key) {
-                    tile.last_used = use_stamp;
-                    stroke.draw_to_pixmap(
-                        path,
-                        &mut tile.pixmap,
-                        tile_transform(coord, raster_scale),
-                    );
-                }
+        // Only the currently visible zoom level is worth updating eagerly.
+        // Overlapping tiles at other levels are invalidated and will be
+        // regenerated lazily if the user returns to those zoom levels.
+        for (&key, tile) in self.rendered_tiles.iter_mut() {
+            if !Self::tile_overlaps_bounds(key, bounds) {
+                continue;
             }
+
+            if key.level == current_level {
+                tile.last_used = use_stamp;
+                let raster_scale = Self::raster_scale_for_level(key.level);
+                stroke.draw_to_pixmap(
+                    path,
+                    &mut tile.pixmap,
+                    tile_transform(key.coord, raster_scale),
+                );
+            } else {
+                stale_tiles.push(key);
+            }
+        }
+
+        for key in stale_tiles {
+            self.rendered_tiles.remove(&key);
         }
     }
 
@@ -1288,24 +1361,28 @@ impl TileRenderer {
             presenter.add_damage(rect);
         }
 
-        // Protect current viewport tiles while evicting old zoom levels.
-        let viewport = presenter
-            .frame_dimensions()
-            .map(|(width, height)| PixelRect::full(width, height));
-        let visible_set: HashSet<RasterTileKey> = viewport
-            .map(|full| {
-                camera.tile_coords_for_screen_rect(full, tile_world_size)
-                    .into_iter()
-                    .map(|coord| RasterTileKey { level, coord })
-                    .collect()
-            })
-            .unwrap_or_else(|| {
-                visible_coords
-                    .into_iter()
-                    .map(|coord| RasterTileKey { level, coord })
-                    .collect()
-            });
-        self.evict_old_tiles(&visible_set);
+        // Building the visible set allocates a Vec and HashSet. Only do that
+        // when the cache is actually over budget and eviction can be needed.
+        let cached_bytes = self.rendered_tiles.len().saturating_mul(TILE_BITMAP_BYTES);
+        if cached_bytes > MAX_TILE_CACHE_BYTES {
+            let viewport = presenter
+                .frame_dimensions()
+                .map(|(width, height)| PixelRect::full(width, height));
+            let visible_set: HashSet<RasterTileKey> = viewport
+                .map(|full| {
+                    camera.tile_coords_for_screen_rect(full, tile_world_size)
+                        .into_iter()
+                        .map(|coord| RasterTileKey { level, coord })
+                        .collect()
+                })
+                .unwrap_or_else(|| {
+                    visible_coords
+                        .into_iter()
+                        .map(|coord| RasterTileKey { level, coord })
+                        .collect()
+                });
+            self.evict_old_tiles(&visible_set);
+        }
     }
 }
 
@@ -1367,29 +1444,33 @@ impl Presenter {
         let Some((frame_width, frame_height)) = self.frame_dimensions() else {
             return Vec::new();
         };
-        let mut damages = Vec::with_capacity(stroke.segments.len());
+        let mut damages = Vec::new();
         let padding = stroke.width * camera.zoom * 0.5 + 2.0;
-        let mut curve_start = stroke.start;
 
-        for segment in &stroke.segments {
-            let min_x = curve_start[0]
+        let segment_rects = stroke.segments.iter().scan(stroke.start, |curve_start, segment| {
+            let start = *curve_start;
+            *curve_start = segment.end;
+            let min_x = start[0]
                 .min(segment.ctrl1[0])
                 .min(segment.ctrl2[0])
                 .min(segment.end[0]);
-            let min_y = curve_start[1]
+            let min_y = start[1]
                 .min(segment.ctrl1[1])
                 .min(segment.ctrl2[1])
                 .min(segment.end[1]);
-            let max_x = curve_start[0]
+            let max_x = start[0]
                 .max(segment.ctrl1[0])
                 .max(segment.ctrl2[0])
                 .max(segment.end[0]);
-            let max_y = curve_start[1]
+            let max_y = start[1]
                 .max(segment.ctrl1[1])
                 .max(segment.ctrl2[1])
                 .max(segment.end[1]);
 
-            if let Some(rect) = PixelRect::from_bounds(
+            // `scan` uses its outer `Option` to signal iterator termination.
+            // Wrap the optional rectangle in `Some` so an off-screen segment
+            // is skipped by `flatten()` rather than ending the scan early.
+            Some(PixelRect::from_bounds(
                 min_x * camera.zoom + camera.pan[0],
                 min_y * camera.zoom + camera.pan[1],
                 max_x * camera.zoom + camera.pan[0],
@@ -1397,11 +1478,10 @@ impl Presenter {
                 padding,
                 frame_width,
                 frame_height,
-            ) {
-                add_damage_rect(&mut damages, rect);
-            }
-            curve_start = segment.end;
-        }
+            ))
+        });
+
+        coalesce_ordered(segment_rects.flatten(), &mut damages);
         damages
     }
 
@@ -1415,24 +1495,58 @@ impl Presenter {
         let Some((frame_width, frame_height)) = self.frame_dimensions() else {
             return Vec::new();
         };
-        let mut damages = self.stroke_damage_rects(stroke, camera);
-        let padding = preview_width * camera.zoom * 0.5 + 2.0;
+        let mut damages = Vec::new();
+        let stroke_padding = stroke.width * camera.zoom * 0.5 + 2.0;
+        let preview_padding = preview_width * camera.zoom * 0.5 + 2.0;
 
-        for pair in preview_points.windows(2) {
+        let segment_rects = stroke.segments.iter().scan(stroke.start, |curve_start, segment| {
+            let start = *curve_start;
+            *curve_start = segment.end;
+            let min_x = start[0]
+                .min(segment.ctrl1[0])
+                .min(segment.ctrl2[0])
+                .min(segment.end[0]);
+            let min_y = start[1]
+                .min(segment.ctrl1[1])
+                .min(segment.ctrl2[1])
+                .min(segment.end[1]);
+            let max_x = start[0]
+                .max(segment.ctrl1[0])
+                .max(segment.ctrl2[0])
+                .max(segment.end[0]);
+            let max_y = start[1]
+                .max(segment.ctrl1[1])
+                .max(segment.ctrl2[1])
+                .max(segment.end[1]);
+
+            // Keep scanning when a segment is outside the framebuffer; the
+            // inner `Option` is flattened away after `scan` has advanced state.
+            Some(PixelRect::from_bounds(
+                min_x * camera.zoom + camera.pan[0],
+                min_y * camera.zoom + camera.pan[1],
+                max_x * camera.zoom + camera.pan[0],
+                max_y * camera.zoom + camera.pan[1],
+                stroke_padding,
+                frame_width,
+                frame_height,
+            ))
+        });
+
+        let preview_rects = preview_points.windows(2).filter_map(|pair| {
             let a = pair[0];
             let b = pair[1];
-            if let Some(rect) = PixelRect::from_bounds(
+            PixelRect::from_bounds(
                 a[0].min(b[0]) * camera.zoom + camera.pan[0],
                 a[1].min(b[1]) * camera.zoom + camera.pan[1],
                 a[0].max(b[0]) * camera.zoom + camera.pan[0],
                 a[1].max(b[1]) * camera.zoom + camera.pan[1],
-                padding,
+                preview_padding,
                 frame_width,
                 frame_height,
-            ) {
-                add_damage_rect(&mut damages, rect);
-            }
-        }
+            )
+        });
+
+        coalesce_ordered(segment_rects.flatten().chain(preview_rects), &mut damages);
         damages
     }
 
@@ -1633,6 +1747,14 @@ impl Presenter {
             return self.render_zoom_frame(camera, interaction);
         }
 
+        // No canonical-frame changes means there is nothing new to submit.
+        // Do this before acquiring a softbuffer buffer: an idle redraw should
+        // not acquire/commit a buffer merely to replay historical backbuffer
+        // repair damage.
+        if self.pending_damage.is_empty() {
+            return false;
+        }
+
         let invert = self.invert_contrast;
         let (Some(surface), Some(frame)) = (self.surface.as_mut(), self.frame_pixmap.as_ref())
         else {
@@ -1701,11 +1823,27 @@ impl Presenter {
             }
         }
 
+        // `update_rects` repairs the acquired backbuffer and may include
+        // damage from older frames when buffer age > 1. The compositor's
+        // damage region is different: only the current frame's changes differ
+        // from the currently displayed surface. If this is a full copy (age
+        // zero or insufficient history), report the whole buffer as damage.
         self.softbuffer_damage.clear();
-        self.softbuffer_damage
-            .extend(self.update_rects.iter().copied().map(PixelRect::to_softbuffer_rect));
+        if needs_full_copy {
+            self.softbuffer_damage.push(full_rect.to_softbuffer_rect());
+        } else {
+            self.softbuffer_damage.extend(
+                self.pending_damage
+                    .iter()
+                    .copied()
+                    .map(PixelRect::to_softbuffer_rect),
+            );
+        }
         let presented = buffer.present_with_damage(&self.softbuffer_damage).is_ok();
         if presented {
+            // Only a successful present consumes current damage. On failure,
+            // pending_damage and the existing history remain intact so a later
+            // redraw can retry without losing any changed pixels.
             // Rotate damage vectors through a small pool. This avoids cloning
             // the current rectangles and, after the history fills, reuses the
             // oldest vector's allocation for the next frame.
@@ -1777,7 +1915,13 @@ impl Default for MathCanvasApp {
 impl MathCanvasApp {
     fn register_stroke_in_tiles(&mut self, stroke_id: u64, bounds: [f32; 4]) {
         // Document already indexed the stroke atomically when it was appended.
-        self.tile_renderer.append_stroke_to_cached_tiles(&self.document, stroke_id, bounds);
+        let current_level = tile_zoom_level(self.camera.zoom);
+        self.tile_renderer.append_stroke_to_cached_tiles(
+            &self.document,
+            stroke_id,
+            bounds,
+            current_level,
+        );
     }
 
     fn screen_to_world(&self, pos: PhysicalPosition<f64>) -> [f32; 2] {
