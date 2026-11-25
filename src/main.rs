@@ -272,9 +272,11 @@ fn tile_transform(coord: TileCoord, raster_scale: f32) -> Transform {
 
 #[derive(Clone, Copy)]
 struct BilinearXSample {
+    // Source pixel indices (not byte offsets).
     x0: usize,
     x1: usize,
-    fx: f32,
+    // Quantised horizontal weight in 0..=256.
+    weight: u16,
 }
 
 fn composite_tile_region(
@@ -287,6 +289,7 @@ fn composite_tile_region(
     zoom: f32,
     pan: [f32; 2],
     x_samples: &mut Vec<BilinearXSample>,
+    vertical_samples: &mut Vec<u16>,
 ) {
     let tile_left = coord.x as f32 * tile_world_size * zoom + pan[0];
     let tile_top = coord.y as f32 * tile_world_size * zoom + pan[1];
@@ -315,67 +318,140 @@ fn composite_tile_region(
     let source_stride = source_width * 4;
     let source_data = source.data();
     let destination_data = destination.data_mut();
-    let gutter = TILE_GUTTER_PX as f32;
+    let gutter = TILE_GUTTER_PX as usize;
+
+    // When the displayed scale exactly matches the raster scale and the tile
+    // origin is pixel-aligned, every source sample is an exact pixel. Copy rows
+    // directly instead of building interpolation samples or doing any blending.
+    let aligned_origin = if (zoom - raster_scale).abs() <= 1.0e-6 {
+        let rounded_left = tile_left.round();
+        let rounded_top = tile_top.round();
+        if (tile_left - rounded_left).abs() <= 1.0e-5
+            && (tile_top - rounded_top).abs() <= 1.0e-5
+        {
+            Some((rounded_left as i64, rounded_top as i64))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some((origin_x, origin_y)) = aligned_origin {
+        let copy_width = (x1 - x0) as usize;
+        let copy_height = (y1 - y0) as usize;
+        let source_x = x0 as i64 - origin_x + gutter as i64;
+        let source_y = y0 as i64 - origin_y + gutter as i64;
+        let source_x_end = source_x + copy_width as i64;
+        let source_y_end = source_y + copy_height as i64;
+
+        if source_x >= 0
+            && source_y >= 0
+            && source_x_end <= source_width as i64
+            && source_y_end <= source_height as i64
+        {
+            let copy_bytes = copy_width * 4;
+            let source_x_byte = source_x as usize * 4;
+            let destination_x_byte = x0 as usize * 4;
+            for row in 0..copy_height {
+                let source_start = (source_y as usize + row) * source_stride + source_x_byte;
+                let destination_start = (y0 as usize + row) * destination_stride
+                    + destination_x_byte;
+                destination_data[destination_start..destination_start + copy_bytes]
+                    .copy_from_slice(&source_data[source_start..source_start + copy_bytes]);
+            }
+            return;
+        }
+    }
+
     let max_source_x = source_width.saturating_sub(1) as f32;
     let max_source_y = source_height.saturating_sub(1) as f32;
 
-    // Horizontal sampling coordinates are shared by every row of this tile.
+    // Horizontal coordinates are shared by every output row. Store pixel
+    // indices and Q8 weights so the per-row interpolation uses integer math.
     x_samples.clear();
     let sample_count = (x1 - x0) as usize;
     x_samples.reserve(sample_count);
 
     for x in x0..x1 {
-        let source_x = ((x as f32 + 0.5 - tile_left) / zoom) * raster_scale + gutter - 0.5;
+        let source_x = ((x as f32 + 0.5 - tile_left) / zoom) * raster_scale
+            + TILE_GUTTER_PX as f32
+            - 0.5;
         let source_x = source_x.clamp(0.0, max_source_x);
         let sx0 = source_x.floor() as usize;
         let sx1 = (sx0 + 1).min(source_width - 1);
+        let weight = ((source_x - sx0 as f32) * 256.0 + 0.5)
+            .floor()
+            .clamp(0.0, 256.0) as u16;
         x_samples.push(BilinearXSample {
-            x0: sx0 * 4,
-            x1: sx1 * 4,
-            fx: source_x - sx0 as f32,
+            x0: sx0,
+            x1: sx1,
+            weight,
         });
     }
 
+    // The x mapping is monotonic, so the first and last samples span every
+    // source pixel needed by this clipped output row. Reuse only that span;
+    // small damage rectangles therefore do not blend an entire tile row.
+    let source_x_start = x_samples.first().expect("non-empty output span").x0;
+    let source_x_end = x_samples.last().expect("non-empty output span").x1;
+    let intermediate_pixels = source_x_end - source_x_start + 1;
+    vertical_samples.resize(intermediate_pixels * 3, 0);
+
     for y in y0..y1 {
-        let source_y = ((y as f32 + 0.5 - tile_top) / zoom) * raster_scale + gutter - 0.5;
+        let source_y = ((y as f32 + 0.5 - tile_top) / zoom) * raster_scale
+            + TILE_GUTTER_PX as f32
+            - 0.5;
         let source_y = source_y.clamp(0.0, max_source_y);
         let sy0 = source_y.floor() as usize;
         let sy1 = (sy0 + 1).min(source_height - 1);
-        let fy = source_y - sy0 as f32;
-        let inv_fy = 1.0 - fy;
+        let wy = ((source_y - sy0 as f32) * 256.0 + 0.5)
+            .floor()
+            .clamp(0.0, 256.0) as u32;
+        let inv_wy = 256 - wy;
 
         let row0_start = sy0 * source_stride;
         let row1_start = sy1 * source_stride;
         let row0 = &source_data[row0_start..row0_start + source_stride];
         let row1 = &source_data[row1_start..row1_start + source_stride];
 
+        let source_byte_start = source_x_start * 4;
+        let source_byte_end = (source_x_end + 1) * 4;
+        let top_span = &row0[source_byte_start..source_byte_end];
+        let bottom_span = &row1[source_byte_start..source_byte_end];
+
+        // Pass 1: vertical Q8 blend. Keep the result at 16-bit precision
+        // (0..=65,280) rather than rounding back to 8-bit between passes.
+        for ((vertical_pixel, top_pixel), bottom_pixel) in vertical_samples
+            .chunks_exact_mut(3)
+            .zip(top_span.chunks_exact(4))
+            .zip(bottom_span.chunks_exact(4))
+        {
+            for channel in 0..3 {
+                vertical_pixel[channel] = (top_pixel[channel] as u32 * inv_wy
+                    + bottom_pixel[channel] as u32 * wy) as u16;
+            }
+        }
+
         let destination_start = y as usize * destination_stride + x0 as usize * 4;
         let destination_end = destination_start + sample_count * 4;
         let destination_row = &mut destination_data[destination_start..destination_end];
 
+        // Pass 2: horizontal Q8 blend and one final rounding step (Q16).
         for (dst, sample) in destination_row
             .chunks_exact_mut(4)
             .zip(x_samples.iter())
         {
-            let fx = sample.fx;
-            let inv_fx = 1.0 - fx;
-            let sx0 = sample.x0;
-            let sx1 = sample.x1;
-            let mut rgb = [0u8; 3];
+            let left = (sample.x0 - source_x_start) * 3;
+            let right = (sample.x1 - source_x_start) * 3;
+            let wx = sample.weight as u32;
+            let inv_wx = 256 - wx;
 
             for channel in 0..3 {
-                let top = row0[sx0 + channel] as f32 * inv_fx
-                    + row0[sx1 + channel] as f32 * fx;
-                let bottom = row1[sx0 + channel] as f32 * inv_fx
-                    + row1[sx1 + channel] as f32 * fx;
-                rgb[channel] = (top * inv_fy + bottom * fy)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
+                let blended = vertical_samples[left + channel] as u32 * inv_wx
+                    + vertical_samples[right + channel] as u32 * wx;
+                dst[channel] = ((blended + 32_768) >> 16) as u8;
             }
-
-            dst[0] = rgb[0];
-            dst[1] = rgb[1];
-            dst[2] = rgb[2];
             dst[3] = 255;
         }
     }
@@ -1080,6 +1156,8 @@ struct TileRenderer {
     // Reused scratch storage keeps per-frame compositing and cache maintenance
     // from allocating temporary vectors on every call.
     x_samples: Vec<BilinearXSample>,
+    // Reused 16-bit intermediate for fixed-point vertical interpolation.
+    vertical_samples: Vec<u16>,
     cached_levels: Vec<i32>,
     cached_level_set: HashSet<i32>,
     eviction_candidates: Vec<(u64, RasterTileKey)>,
@@ -1352,6 +1430,7 @@ impl TileRenderer {
                         zoom,
                         pan,
                         &mut self.x_samples,
+                        &mut self.vertical_samples,
                     );
                 }
             }
@@ -2560,7 +2639,19 @@ impl ApplicationHandler for MathCanvasApp {
                     ElementState::Released
                         if matches!(&self.interaction.mode, InteractionMode::Panning { .. }) =>
                     {
-                        self.interaction.mode = InteractionMode::Idle;
+                        let InteractionMode::Panning { origin, offset } =
+                            std::mem::replace(&mut self.interaction.mode, InteractionMode::Idle)
+                        else {
+                            unreachable!("panning interaction changed during release");
+                        };
+
+                        // The live pan preview is shifted by this integer offset.
+                        // Commit the same camera position so rebuilding the canonical
+                        // frame cannot introduce a sub-pixel jump on release.
+                        self.camera.pan = [
+                            origin[0] + offset[0] as f32,
+                            origin[1] + offset[1] as f32,
+                        ];
                         self.tile_renderer.mark_frame_dirty();
                         self.redraw_wanted = false;
                         if let Some(win) = &self.window {
