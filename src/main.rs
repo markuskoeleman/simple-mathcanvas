@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use softbuffer::{Context, Rect, Surface};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -40,6 +40,19 @@ const RGB_INVERT_MASK: u32 = 0x00FF_FFFF;
 
 // How long scrolling must stop before committing the final vector rendering.
 const ZOOM_SETTLE_DELAY: Duration = Duration::from_millis(180);
+
+// World-aligned CPU raster tiles. The raster scale is quantised to four
+// steps per octave, keeping resampling modest while allowing cached
+// tiles to be reused during ordinary panning and small zoom changes.
+const TILE_SIZE_PX: u32 = 512;
+// Enough raster padding for the current 2.2-world-unit brush at maximum zoom
+// (including antialiasing). Increase this if much wider brushes are introduced.
+const TILE_GUTTER_PX: u32 = 32;
+const TILE_BITMAP_SIZE: u32 = TILE_SIZE_PX + TILE_GUTTER_PX * 2;
+// Bound the raster cache by memory rather than tile count. A 512px tile with
+// 32px gutters on every side occupies about 1.27 MiB (RGBA8).
+const MAX_TILE_CACHE_BYTES: usize = 128 * 1024 * 1024;
+const TILE_BITMAP_BYTES: usize = TILE_BITMAP_SIZE as usize * TILE_BITMAP_SIZE as usize * 4;
 
 // --- Serializable Vector Data Model ---
 
@@ -200,6 +213,133 @@ impl VectorStroke {
 #[derive(Default)]
 struct StrokeRenderCache {
     paths: Vec<Path>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TileCoord {
+    x: i32,
+    y: i32,
+}
+
+struct CachedTile {
+    pixmap: Pixmap,
+    last_used: u64,
+}
+
+struct TileRenderCache {
+    zoom_level: i32,
+    raster_scale: f32,
+    world_size: f32,
+    // Stable stroke IDs preserve membership across Vec compaction/removals.
+    stroke_ids_by_tile: HashMap<TileCoord, Vec<u64>>,
+    tiles_by_stroke: HashMap<u64, Vec<TileCoord>>,
+    rendered_tiles: HashMap<TileCoord, CachedTile>,
+    usage_clock: u64,
+}
+
+impl Default for TileRenderCache {
+    fn default() -> Self {
+        Self {
+            zoom_level: i32::MIN,
+            raster_scale: 1.0,
+            world_size: TILE_SIZE_PX as f32,
+            stroke_ids_by_tile: HashMap::new(),
+            tiles_by_stroke: HashMap::new(),
+            rendered_tiles: HashMap::new(),
+            usage_clock: 0,
+        }
+    }
+}
+
+fn tile_zoom_level(zoom: f32) -> i32 {
+    // Four levels per octave keep tile resampling within about 9% of native scale.
+    (zoom.max(0.0001).log2() * 4.0).round() as i32
+}
+
+fn tile_coords_for_bounds(bounds: [f32; 4], world_size: f32, gutter_world: f32) -> Vec<TileCoord> {
+    let min_x = ((bounds[0] - gutter_world) / world_size).floor() as i32;
+    let min_y = ((bounds[1] - gutter_world) / world_size).floor() as i32;
+    let max_x = ((bounds[2] + gutter_world) / world_size).floor() as i32;
+    let max_y = ((bounds[3] + gutter_world) / world_size).floor() as i32;
+
+    let mut coords = Vec::new();
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            coords.push(TileCoord { x, y });
+        }
+    }
+    coords
+}
+
+fn sample_bilinear_rgba(data: &[u8], width: usize, height: usize, x: f32, y: f32, out: &mut [u8]) {
+    let max_x = width.saturating_sub(1) as f32;
+    let max_y = height.saturating_sub(1) as f32;
+    let x = x.clamp(0.0, max_x);
+    let y = y.clamp(0.0, max_y);
+
+    let x0 = x.floor() as usize;
+    let y0 = y.floor() as usize;
+    let x1 = (x0 + 1).min(width - 1);
+    let y1 = (y0 + 1).min(height - 1);
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+
+    let i00 = (y0 * width + x0) * 4;
+    let i10 = (y0 * width + x1) * 4;
+    let i01 = (y1 * width + x0) * 4;
+    let i11 = (y1 * width + x1) * 4;
+
+    for channel in 0..4 {
+        let top = data[i00 + channel] as f32 * (1.0 - fx)
+            + data[i10 + channel] as f32 * fx;
+        let bottom = data[i01 + channel] as f32 * (1.0 - fx)
+            + data[i11 + channel] as f32 * fx;
+        out[channel] = (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8;
+    }
+}
+
+fn composite_tile_region(
+    destination: &mut Pixmap,
+    source: &Pixmap,
+    coord: TileCoord,
+    clip: PixelRect,
+    tile_world_size: f32,
+    raster_scale: f32,
+    zoom: f32,
+    pan: [f32; 2],
+) {
+    let tile_left = coord.x as f32 * tile_world_size * zoom + pan[0];
+    let tile_top = coord.y as f32 * tile_world_size * zoom + pan[1];
+    let tile_right = tile_left + tile_world_size * zoom;
+    let tile_bottom = tile_top + tile_world_size * zoom;
+
+    // Pixel centres are used so adjacent tiles neither overlap nor leave gaps.
+    let x0 = (tile_left - 0.5).ceil().max(clip.x0 as f32).max(0.0) as u32;
+    let y0 = (tile_top - 0.5).ceil().max(clip.y0 as f32).max(0.0) as u32;
+    let x1 = (tile_right - 0.5).ceil().min(clip.x1 as f32).min(destination.width() as f32) as u32;
+    let y1 = (tile_bottom - 0.5).ceil().min(clip.y1 as f32).min(destination.height() as f32) as u32;
+
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+
+    let source_width = source.width() as usize;
+    let source_height = source.height() as usize;
+    let source_data = source.data();
+    let destination_width = destination.width() as usize;
+    let destination_data = destination.data_mut();
+    let gutter = TILE_GUTTER_PX as f32;
+
+    let mut rgba = [0u8; 4];
+    for y in y0..y1 {
+        let source_y = ((y as f32 + 0.5 - tile_top) / zoom) * raster_scale + gutter - 0.5;
+        for x in x0..x1 {
+            let source_x = ((x as f32 + 0.5 - tile_left) / zoom) * raster_scale + gutter - 0.5;
+            sample_bilinear_rgba(source_data, source_width, source_height, source_x, source_y, &mut rgba);
+            let destination_index = (y as usize * destination_width + x as usize) * 4;
+            destination_data[destination_index..destination_index + 4].copy_from_slice(&rgba);
+        }
+    }
 }
 
 fn rdp_simplify(pts: &[[f32; 2]], epsilon: f32) -> Vec<[f32; 2]> {
@@ -511,11 +651,15 @@ struct MathCanvasApp {
     window: Option<Rc<dyn Window>>,
     surface: Option<Surface<Rc<dyn Window>, Rc<dyn Window>>>,
 
-    committed_pixmap: Option<Pixmap>,
     frame_pixmap: Option<Pixmap>,
 
     strokes: Vec<VectorStroke>,
     stroke_cache: StrokeRenderCache,
+    // Stable IDs let tile membership survive vector removals/compaction.
+    stroke_ids: Vec<u64>,
+    stroke_id_to_index: HashMap<u64, usize>,
+    next_stroke_id: u64,
+    tile_cache: TileRenderCache,
     active_points: Vec<[f32; 2]>,
     pan: [f32; 2],
     zoom: f32,
@@ -533,6 +677,8 @@ struct MathCanvasApp {
     invert_key_held: bool,
 
     cache_dirty: bool,
+    // World-tile invalidations expressed as viewport damage awaiting a redraw.
+    pending_tile_damage: Option<PixelRect>,
 
     // Drawing preview state
     preview_points_rendered: usize,
@@ -572,10 +718,13 @@ impl Default for MathCanvasApp {
         Self {
             window: None,
             surface: None,
-            committed_pixmap: None,
             frame_pixmap: None,
             strokes: Vec::new(),
             stroke_cache: StrokeRenderCache::default(),
+            stroke_ids: Vec::new(),
+            stroke_id_to_index: HashMap::new(),
+            next_stroke_id: 1,
+            tile_cache: TileRenderCache::default(),
             active_points: Vec::new(),
             pan: [0.0, 0.0],
             zoom: 1.0,
@@ -589,6 +738,7 @@ impl Default for MathCanvasApp {
             invert_contrast: false,
             invert_key_held: false,
             cache_dirty: false,
+            pending_tile_damage: None,
 
             preview_points_rendered: 0,
 
@@ -627,46 +777,38 @@ impl MathCanvasApp {
         ]
     }
 
-    fn sync_frame_from_committed(&mut self) {
-        if let (Some(committed), Some(frame)) =
-            (self.committed_pixmap.as_ref(), self.frame_pixmap.as_mut())
-        {
-            frame.data_mut().copy_from_slice(committed.data());
-        }
-
-        self.repack_frame_full();
+    fn screen_damage_for_world_bounds(&self, bounds: [f32; 4]) -> Option<PixelRect> {
+        let frame = self.frame_pixmap.as_ref()?;
+        PixelRect::from_bounds(
+            bounds[0] * self.zoom + self.pan[0],
+            bounds[1] * self.zoom + self.pan[1],
+            bounds[2] * self.zoom + self.pan[0],
+            bounds[3] * self.zoom + self.pan[1],
+            2.0,
+            frame.width(),
+            frame.height(),
+        )
     }
 
-    // Synchronise only the pixels affected by a newly committed stroke.
-    // The rectangle is in framebuffer coordinates and uses exclusive max bounds.
-    fn sync_frame_region_from_committed(&mut self, rect: PixelRect) -> bool {
-        {
-            let (Some(committed), Some(frame)) =
-                (self.committed_pixmap.as_ref(), self.frame_pixmap.as_mut())
-            else {
-                return false;
-            };
+    fn add_pending_tile_damage(&mut self, rect: PixelRect) {
+        self.pending_tile_damage = Some(
+            self.pending_tile_damage
+                .map_or(rect, |existing| existing.union(rect)),
+        );
+    }
 
-            if frame.width() != committed.width() || frame.height() != committed.height() {
-                return false;
-            }
-
-            let row_stride = committed.width() as usize * 4;
-            let x_start = rect.x0 as usize * 4;
-            let x_end = rect.x1 as usize * 4;
-            let committed_data = committed.data();
-            let frame_data = frame.data_mut();
-
-            for y in rect.y0 as usize..rect.y1 as usize {
-                let start = y * row_stride + x_start;
-                let end = y * row_stride + x_end;
-                frame_data[start..end].copy_from_slice(&committed_data[start..end]);
+    fn refresh_pending_tile_damage(&mut self) {
+        if let Some(damage) = self.pending_tile_damage.take() {
+            // Tile pixels are composited straight into the display pixmap. This
+            // removes the need for a second viewport-sized committed pixmap.
+            self.composite_tiles_into_frame(damage);
+            self.update_packed_region_from_frame(damage);
+            if self.is_drawing {
+                // The damaged rectangle may have overwritten part of the live
+                // preview. Rebuild its incremental tail from the first point.
+                self.preview_points_rendered = 1;
             }
         }
-
-        // Convert only the copied region to Softbuffer's packed pixel format.
-        self.update_packed_region_from_frame(rect);
-        true
     }
 
     // Return the screen-space area that may contain either the final Bézier
@@ -678,15 +820,7 @@ impl MathCanvasApp {
         let pan = self.pan;
 
         // VectorStroke::bounds already includes padding for the stroke width.
-        let mut damage = PixelRect::from_bounds(
-            stroke.bounds[0] * zoom + pan[0],
-            stroke.bounds[1] * zoom + pan[1],
-            stroke.bounds[2] * zoom + pan[0],
-            stroke.bounds[3] * zoom + pan[1],
-            2.0, // Additional screen-space antialiasing safety margin.
-            frame.width(),
-            frame.height(),
-        );
+        let mut damage = self.screen_damage_for_world_bounds(stroke.bounds);
 
         // The live preview is drawn from active_points, whereas the committed
         // path is simplified and converted to Bézier curves. Union both bounds.
@@ -720,6 +854,244 @@ impl MathCanvasApp {
         }
 
         damage
+    }
+
+    fn ensure_tile_index_current(&mut self) {
+        let level = tile_zoom_level(self.zoom);
+        if self.tile_cache.zoom_level == level {
+            return;
+        }
+
+        let raster_scale = 2.0_f32.powf(level as f32 * 0.25).max(0.0001);
+        let world_size = TILE_SIZE_PX as f32 / raster_scale;
+        self.tile_cache.zoom_level = level;
+        self.tile_cache.raster_scale = raster_scale;
+        self.tile_cache.world_size = world_size;
+        self.tile_cache.stroke_ids_by_tile.clear();
+        self.tile_cache.tiles_by_stroke.clear();
+        self.tile_cache.rendered_tiles.clear();
+
+        let gutter_world = TILE_GUTTER_PX as f32 / raster_scale;
+        for (index, stroke) in self.strokes.iter().enumerate() {
+            let Some(&stroke_id) = self.stroke_ids.get(index) else {
+                continue;
+            };
+            let coords = tile_coords_for_bounds(stroke.bounds, world_size, gutter_world);
+            for coord in &coords {
+                self.tile_cache
+                    .stroke_ids_by_tile
+                    .entry(*coord)
+                    .or_default()
+                    .push(stroke_id);
+            }
+            self.tile_cache.tiles_by_stroke.insert(stroke_id, coords);
+        }
+    }
+
+    fn rebuild_stroke_id_to_index(&mut self) {
+        self.stroke_id_to_index.clear();
+        self.stroke_id_to_index.reserve(self.stroke_ids.len());
+        for (index, stroke_id) in self.stroke_ids.iter().copied().enumerate() {
+            self.stroke_id_to_index.insert(stroke_id, index);
+        }
+    }
+
+    fn register_stroke_in_tiles(&mut self, stroke_id: u64, bounds: [f32; 4]) {
+        self.ensure_tile_index_current();
+        // A zoom-level rebuild may already have indexed this stroke (e.g. if
+        // the camera scale changed immediately before the commit).
+        if self.tile_cache.tiles_by_stroke.contains_key(&stroke_id) {
+            return;
+        }
+
+        let coords = tile_coords_for_bounds(
+            bounds,
+            self.tile_cache.world_size,
+            TILE_GUTTER_PX as f32 / self.tile_cache.raster_scale,
+        );
+
+        for coord in &coords {
+            self.tile_cache
+                .stroke_ids_by_tile
+                .entry(*coord)
+                .or_default()
+                .push(stroke_id);
+            self.tile_cache.rendered_tiles.remove(coord);
+        }
+        self.tile_cache.tiles_by_stroke.insert(stroke_id, coords);
+    }
+
+    fn unregister_stroke_from_tiles(&mut self, stroke_id: u64) {
+        if let Some(coords) = self.tile_cache.tiles_by_stroke.remove(&stroke_id) {
+            for coord in coords {
+                let remove_entry = if let Some(ids) = self.tile_cache.stroke_ids_by_tile.get_mut(&coord) {
+                    ids.retain(|id| *id != stroke_id);
+                    ids.is_empty()
+                } else {
+                    false
+                };
+                if remove_entry {
+                    self.tile_cache.stroke_ids_by_tile.remove(&coord);
+                }
+                self.tile_cache.rendered_tiles.remove(&coord);
+            }
+        }
+        self.stroke_id_to_index.remove(&stroke_id);
+    }
+
+    fn ensure_tile_rendered(&mut self, coord: TileCoord) {
+        self.tile_cache.usage_clock = self.tile_cache.usage_clock.wrapping_add(1);
+        let use_stamp = self.tile_cache.usage_clock;
+        if let Some(tile) = self.tile_cache.rendered_tiles.get_mut(&coord) {
+            tile.last_used = use_stamp;
+            return;
+        }
+
+        let Some(stroke_ids) = self
+            .tile_cache
+            .stroke_ids_by_tile
+            .get(&coord)
+            .filter(|ids| !ids.is_empty())
+            .cloned()
+        else {
+            // Empty tiles are just the canvas background. Do not allocate a
+            // 576x576 RGBA pixmap to cache a solid colour; the compositor
+            // clears the affected destination rectangle before drawing tiles.
+            return;
+        };
+        let raster_scale = self.tile_cache.raster_scale;
+        let mut pixmap = Pixmap::new(TILE_BITMAP_SIZE, TILE_BITMAP_SIZE)
+            .expect("failed to allocate canvas tile pixmap");
+        pixmap.fill(Color::from_rgba8(0, 0, 0, 255));
+
+        // World -> tile-local pixels. The gutter allows antialiasing to extend
+        // across tile boundaries without creating visible seams.
+        let transform = Transform::from_scale(raster_scale, raster_scale).post_translate(
+            TILE_GUTTER_PX as f32 - coord.x as f32 * TILE_SIZE_PX as f32,
+            TILE_GUTTER_PX as f32 - coord.y as f32 * TILE_SIZE_PX as f32,
+        );
+
+        for stroke_id in stroke_ids {
+            let Some(&index) = self.stroke_id_to_index.get(&stroke_id) else {
+                continue;
+            };
+            if let (Some(stroke), Some(path)) = (
+                self.strokes.get(index),
+                self.stroke_cache.paths.get(index),
+            ) {
+                stroke.draw_to_pixmap(path, &mut pixmap, transform);
+            }
+        }
+
+        self.tile_cache.rendered_tiles.insert(
+            coord,
+            CachedTile {
+                pixmap,
+                last_used: use_stamp,
+            },
+        );
+    }
+
+    fn tile_coords_for_screen_rect(&self, rect: PixelRect) -> Vec<TileCoord> {
+        let world_size = self.tile_cache.world_size;
+        let zoom = self.zoom;
+        let first_x = (rect.x0 as f32 + 0.5 - self.pan[0]) / zoom;
+        let first_y = (rect.y0 as f32 + 0.5 - self.pan[1]) / zoom;
+        let last_x = (rect.x1 as f32 - 0.5 - self.pan[0]) / zoom;
+        let last_y = (rect.y1 as f32 - 0.5 - self.pan[1]) / zoom;
+
+        let min_tx = (first_x.min(last_x) / world_size).floor() as i32;
+        let min_ty = (first_y.min(last_y) / world_size).floor() as i32;
+        let max_tx = (first_x.max(last_x) / world_size).floor() as i32;
+        let max_ty = (first_y.max(last_y) / world_size).floor() as i32;
+
+        let mut coords = Vec::new();
+        for y in min_ty..=max_ty {
+            for x in min_tx..=max_tx {
+                coords.push(TileCoord { x, y });
+            }
+        }
+        coords
+    }
+
+    fn evict_old_tiles(&mut self, visible: &HashSet<TileCoord>) {
+        // All cached tiles use the same RGBA8 dimensions, so the current cache
+        // footprint can be calculated cheaply without tracking bytes on every
+        // insertion/removal path.
+        let mut cached_bytes = self.tile_cache.rendered_tiles.len() * TILE_BITMAP_BYTES;
+
+        while cached_bytes > MAX_TILE_CACHE_BYTES {
+            let oldest = self
+                .tile_cache
+                .rendered_tiles
+                .iter()
+                .filter(|(coord, _)| !visible.contains(*coord))
+                .min_by_key(|(_, tile)| tile.last_used)
+                .map(|(coord, _)| *coord);
+            let Some(coord) = oldest else {
+                // Keep all visible tiles even if the viewport alone exceeds
+                // the nominal memory budget. The budget is a soft cap, not a
+                // reason to evict content needed to display the current view.
+                break;
+            };
+            if self.tile_cache.rendered_tiles.remove(&coord).is_some() {
+                cached_bytes = cached_bytes.saturating_sub(TILE_BITMAP_BYTES);
+            }
+        }
+    }
+
+    // Rebuild or composite only tiles intersecting a framebuffer rectangle.
+    // Tiles are written directly into the display pixmap; empty tiles remain
+    // implicit background and therefore consume no cached raster memory.
+    fn composite_tiles_into_frame(&mut self, rect: PixelRect) {
+        self.ensure_tile_index_current();
+        let visible_coords = self.tile_coords_for_screen_rect(rect);
+        for coord in &visible_coords {
+            self.ensure_tile_rendered(*coord);
+        }
+
+        let tile_world_size = self.tile_cache.world_size;
+        let raster_scale = self.tile_cache.raster_scale;
+        let zoom = self.zoom;
+        let pan = self.pan;
+        if let Some(destination) = self.frame_pixmap.as_mut() {
+            // Restore the region to the opaque canvas background first. This
+            // also clears old strokes and temporary preview pixels after edits.
+            let width = destination.width() as usize;
+            let data = destination.data_mut();
+            const BACKGROUND_RGBA: [u8; 4] = [0, 0, 0, 255];
+            for y in rect.y0 as usize..rect.y1 as usize {
+                let start = (y * width + rect.x0 as usize) * 4;
+                let end = (y * width + rect.x1 as usize) * 4;
+                for pixel in data[start..end].chunks_exact_mut(4) {
+                    pixel.copy_from_slice(&BACKGROUND_RGBA);
+                }
+            }
+
+            for coord in &visible_coords {
+                if let Some(tile) = self.tile_cache.rendered_tiles.get(coord) {
+                    composite_tile_region(
+                        destination,
+                        &tile.pixmap,
+                        *coord,
+                        rect,
+                        tile_world_size,
+                        raster_scale,
+                        zoom,
+                        pan,
+                    );
+                }
+            }
+        }
+
+        let viewport = self
+            .frame_pixmap
+            .as_ref()
+            .map(|pixmap| PixelRect::full(pixmap.width(), pixmap.height()));
+        let visible_set: HashSet<TileCoord> = viewport
+            .map(|full| self.tile_coords_for_screen_rect(full).into_iter().collect())
+            .unwrap_or_else(|| visible_coords.into_iter().collect());
+        self.evict_old_tiles(&visible_set);
     }
 
     fn repack_frame_full(&mut self) {
@@ -980,7 +1352,7 @@ impl MathCanvasApp {
         self.cache_dirty = true;
 
         // Restore the proper vector-rendered canvas before the new interaction.
-        self.ensure_committed_cache_current();
+        self.ensure_frame_current();
 
         // Update the native cursor to the final brush size.
         self.update_brush_cursor(event_loop);
@@ -997,11 +1369,13 @@ impl MathCanvasApp {
         event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
     }
 
-    fn ensure_committed_cache_current(&mut self) {
+    fn ensure_frame_current(&mut self) {
         if self.cache_dirty {
-            self.rebuild_committed_cache();
-            self.sync_frame_from_committed();
+            self.rebuild_frame_from_tiles();
             self.cache_dirty = false;
+            self.pending_tile_damage = None;
+        } else {
+            self.refresh_pending_tile_damage();
         }
     }
 
@@ -1094,23 +1468,82 @@ impl MathCanvasApp {
         let eraser_radius = self.current_stroke_width * 0.5;
         let flatness_tolerance = ERASER_FLATNESS_PX / self.zoom;
 
-        let mut erased_any = false;
+        // Query only spatial cells intersected by the swept eraser capsule.
+        self.ensure_tile_index_current();
+        let query_bounds = [
+            from[0].min(to[0]) - eraser_radius,
+            from[1].min(to[1]) - eraser_radius,
+            from[0].max(to[0]) + eraser_radius,
+            from[1].max(to[1]) + eraser_radius,
+        ];
+        let query_tiles = tile_coords_for_bounds(
+            query_bounds,
+            self.tile_cache.world_size,
+            TILE_GUTTER_PX as f32 / self.tile_cache.raster_scale,
+        );
 
-        // Iterate backwards to preserve drawing order when removing.
-        for index in (0..self.strokes.len()).rev() {
-            if stroke_touched_by_eraser(&self.strokes[index], from, to, eraser_radius, flatness_tolerance) {
-                self.strokes.remove(index);
-                self.stroke_cache.paths.remove(index);
+        let mut candidate_ids = Vec::new();
+        for coord in query_tiles {
+            if let Some(ids) = self.tile_cache.stroke_ids_by_tile.get(&coord) {
+                candidate_ids.extend(ids.iter().copied());
+            }
+        }
+        candidate_ids.sort_unstable();
+        candidate_ids.dedup();
 
-                erased_any = true;
+        let mut removed_ids = HashSet::new();
+        let mut damage = None;
+        for stroke_id in candidate_ids {
+            let Some(&index) = self.stroke_id_to_index.get(&stroke_id) else {
+                continue;
+            };
+            let stroke = &self.strokes[index];
+            if stroke_touched_by_eraser(
+                stroke,
+                from,
+                to,
+                eraser_radius,
+                flatness_tolerance,
+            ) {
+                removed_ids.insert(stroke_id);
+                if let Some(stroke_damage) = self.screen_damage_for_world_bounds(stroke.bounds) {
+                    damage = Some(damage.map_or(stroke_damage, |rect: PixelRect| rect.union(stroke_damage)));
+                }
             }
         }
 
-        if erased_any {
-            self.cache_dirty = true;
+        if removed_ids.is_empty() {
+            return false;
         }
 
-        erased_any
+        // Compact the document and its parallel render/id arrays once, rather
+        // than repeatedly shifting their tails with Vec::remove().
+        let old_strokes = std::mem::take(&mut self.strokes);
+        let old_paths = std::mem::take(&mut self.stroke_cache.paths);
+        let old_ids = std::mem::take(&mut self.stroke_ids);
+        self.strokes = Vec::with_capacity(old_strokes.len() - removed_ids.len());
+        self.stroke_cache.paths = Vec::with_capacity(old_paths.len() - removed_ids.len());
+        self.stroke_ids = Vec::with_capacity(old_ids.len() - removed_ids.len());
+
+        for ((stroke, path), stroke_id) in old_strokes
+            .into_iter()
+            .zip(old_paths.into_iter())
+            .zip(old_ids.into_iter())
+        {
+            if removed_ids.contains(&stroke_id) {
+                self.unregister_stroke_from_tiles(stroke_id);
+            } else {
+                self.strokes.push(stroke);
+                self.stroke_cache.paths.push(path);
+                self.stroke_ids.push(stroke_id);
+            }
+        }
+
+        self.rebuild_stroke_id_to_index();
+        if let Some(damage) = damage {
+            self.add_pending_tile_damage(damage);
+        }
+        true
     }
 
     fn update_brush_cursor(&self, event_loop: &dyn ActiveEventLoop) {
@@ -1193,34 +1626,15 @@ impl MathCanvasApp {
         }
     }
 
-    fn rebuild_committed_cache(&mut self) {
-        let transform = self.camera_transform();
-        let Some(pixmap) = self.committed_pixmap.as_mut() else {
+    fn rebuild_frame_from_tiles(&mut self) {
+        let Some(pixmap) = self.frame_pixmap.as_ref() else {
             return;
         };
-        pixmap.fill(Color::from_rgba8(0, 0, 0, 255));
+        let full = PixelRect::full(pixmap.width(), pixmap.height());
+        self.composite_tiles_into_frame(full);
+        self.repack_frame_full();
 
-        let w = pixmap.width() as f32;
-        let h = pixmap.height() as f32;
-        let view_min_x = -self.pan[0] / self.zoom;
-        let view_min_y = -self.pan[1] / self.zoom;
-        let view_max_x = (w - self.pan[0]) / self.zoom;
-        let view_max_y = (h - self.pan[1]) / self.zoom;
-
-        debug_assert_eq!(self.strokes.len(), self.stroke_cache.paths.len(),);
-
-        for (stroke, path) in self.strokes.iter().zip(&self.stroke_cache.paths) {
-            if stroke.bounds[2] < view_min_x
-                || stroke.bounds[0] > view_max_x
-                || stroke.bounds[3] < view_min_y
-                || stroke.bounds[1] > view_max_y
-            {
-                continue;
-            }
-
-            stroke.draw_to_pixmap(path, pixmap, transform);
-        }
-        // The committed pixmap now represents the current camera position.
+        // The frame pixmap now represents the current camera position.
         self.pan_origin = self.pan;
         self.pan_preview_offset = [0, 0];
         self.pan_source_frame = None;
@@ -1366,7 +1780,6 @@ impl ApplicationHandler for MathCanvasApp {
         if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
             surface.resize(w, h).unwrap();
 
-            self.committed_pixmap = Pixmap::new(size.width, size.height);
             self.frame_pixmap = Pixmap::new(size.width, size.height);
         }
 
@@ -1377,8 +1790,7 @@ impl ApplicationHandler for MathCanvasApp {
         self.update_brush_cursor(event_loop);
 
         // Initialise the background cache.
-        self.rebuild_committed_cache();
-        self.sync_frame_from_committed();
+        self.rebuild_frame_from_tiles();
 
         if let Some(win) = &self.window {
             win.request_redraw();
@@ -1488,11 +1900,11 @@ impl ApplicationHandler for MathCanvasApp {
                     self.pan_preview_offset = [0, 0];
                     self.pan_origin = self.pan;
 
-                    self.committed_pixmap = Pixmap::new(size.width, size.height);
                     self.frame_pixmap = Pixmap::new(size.width, size.height);
 
                     self.damage_history.clear();
                     self.pending_damage = None;
+                    self.pending_tile_damage = None;
 
                     self.cache_dirty = true;
 
@@ -1522,11 +1934,16 @@ impl ApplicationHandler for MathCanvasApp {
                         }
                     }
                     Key::Character(ref c) if pressed && c.eq_ignore_ascii_case("z") => {
-                        if self.strokes.pop().is_some() {
+                        if let Some(removed_stroke) = self.strokes.pop() {
                             let removed_path = self.stroke_cache.paths.pop();
                             debug_assert!(removed_path.is_some());
-
-                            self.cache_dirty = true;
+                            if let Some(stroke_id) = self.stroke_ids.pop() {
+                                self.unregister_stroke_from_tiles(stroke_id);
+                            }
+                            self.rebuild_stroke_id_to_index();
+                            if let Some(damage) = self.screen_damage_for_world_bounds(removed_stroke.bounds) {
+                                self.add_pending_tile_damage(damage);
+                            }
 
                             if let Some(win) = &self.window {
                                 win.request_redraw();
@@ -1565,7 +1982,7 @@ impl ApplicationHandler for MathCanvasApp {
                     {
                         // erasing branch
                         self.finish_zoom_interaction(event_loop);
-                        self.ensure_committed_cache_current();
+                        self.ensure_frame_current();
 
                         self.is_erasing = true;
 
@@ -1578,7 +1995,7 @@ impl ApplicationHandler for MathCanvasApp {
                     {
                         // drawing-start branch
                         self.finish_zoom_interaction(event_loop);
-                        self.ensure_committed_cache_current();
+                        self.ensure_frame_current();
 
                         self.is_drawing = true;
                         self.active_points.clear();
@@ -1623,38 +2040,37 @@ impl ApplicationHandler for MathCanvasApp {
                             )
                         };
 
-                        // Commit the stroke to the retained vector model and CPU pixmap.
+                        // Commit the stroke to the retained vector document. Its affected
+                        // world-space tiles are invalidated and regenerated on demand.
                         let mut commit_damage = None;
                         let mut commit_succeeded = false;
 
                         if let Some(stroke) = stroke {
                             if let Some(path) = stroke.build_render_path() {
-                                // Calculate damage before moving the stroke into the document.
                                 commit_damage = self.stroke_commit_damage_rect(&stroke);
-
-                                let transform = self.camera_transform();
-                                if let Some(committed) = self.committed_pixmap.as_mut() {
-                                    stroke.draw_to_pixmap(&path, committed, transform);
-                                }
+                                let stroke_id = self.next_stroke_id;
+                                self.next_stroke_id = self.next_stroke_id.wrapping_add(1).max(1);
+                                let bounds = stroke.bounds;
 
                                 self.strokes.push(stroke);
                                 self.stroke_cache.paths.push(path);
+                                self.stroke_ids.push(stroke_id);
+                                self.stroke_id_to_index.insert(stroke_id, self.strokes.len() - 1);
+                                self.register_stroke_in_tiles(stroke_id, bounds);
                                 commit_succeeded = true;
                             }
                         }
 
-                        // Replace only the temporary preview area with the final committed
-                        // pixels. A successful off-screen commit needs no framebuffer work.
+                        // Restore the preview area from the tile renderer. This clears any
+                        // temporary polyline pixels and composites the final Bézier stroke.
                         if commit_succeeded {
                             if let Some(damage) = commit_damage {
-                                if !self.sync_frame_region_from_committed(damage) {
-                                    // Defensive fallback if the pixmap dimensions changed.
-                                    self.sync_frame_from_committed();
-                                }
+                                self.composite_tiles_into_frame(damage);
+                                self.update_packed_region_from_frame(damage);
                             }
                         } else {
-                            // Preserve the old recovery behaviour if path creation fails.
-                            self.sync_frame_from_committed();
+                            // Preserve the recovery behaviour if path creation fails.
+                            self.rebuild_frame_from_tiles();
                         }
 
                         // Clear temporary stroke data.
@@ -1668,7 +2084,7 @@ impl ApplicationHandler for MathCanvasApp {
                     }
                     ElementState::Pressed if is_middle_press || is_primary_press => {
                         self.finish_zoom_interaction(event_loop);
-                        self.ensure_committed_cache_current();
+                        self.ensure_frame_current();
 
                         self.is_panning = true;
 
@@ -1752,7 +2168,7 @@ impl ApplicationHandler for MathCanvasApp {
 
                 // Capture the original image only once, on the first wheel event.
                 if !self.is_zooming {
-                    self.ensure_committed_cache_current();
+                    self.ensure_frame_current();
 
                     self.is_zooming = true;
 
@@ -1792,14 +2208,17 @@ impl ApplicationHandler for MathCanvasApp {
 
                 // Don't rebuild the vector canvas while temporary zooming
                 // or temporary panning is active.
-                if self.cache_dirty && !self.is_zooming && !self.is_panning {
-                    self.rebuild_committed_cache();
-                    self.sync_frame_from_committed();
+                if !self.is_zooming && !self.is_panning {
+                    if self.cache_dirty {
+                        self.rebuild_frame_from_tiles();
+                        self.cache_dirty = false;
+                        self.pending_tile_damage = None;
 
-                    self.cache_dirty = false;
-
-                    if self.is_drawing {
-                        self.preview_points_rendered = 1;
+                        if self.is_drawing {
+                            self.preview_points_rendered = 1;
+                        }
+                    } else {
+                        self.refresh_pending_tile_damage();
                     }
                 }
 
