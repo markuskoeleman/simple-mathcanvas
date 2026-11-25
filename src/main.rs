@@ -271,31 +271,11 @@ fn tile_coords_for_bounds(bounds: [f32; 4], world_size: f32, gutter_world: f32) 
     coords
 }
 
-fn sample_bilinear_rgba(data: &[u8], width: usize, height: usize, x: f32, y: f32, out: &mut [u8]) {
-    let max_x = width.saturating_sub(1) as f32;
-    let max_y = height.saturating_sub(1) as f32;
-    let x = x.clamp(0.0, max_x);
-    let y = y.clamp(0.0, max_y);
-
-    let x0 = x.floor() as usize;
-    let y0 = y.floor() as usize;
-    let x1 = (x0 + 1).min(width - 1);
-    let y1 = (y0 + 1).min(height - 1);
-    let fx = x - x0 as f32;
-    let fy = y - y0 as f32;
-
-    let i00 = (y0 * width + x0) * 4;
-    let i10 = (y0 * width + x1) * 4;
-    let i01 = (y1 * width + x0) * 4;
-    let i11 = (y1 * width + x1) * 4;
-
-    for channel in 0..4 {
-        let top = data[i00 + channel] as f32 * (1.0 - fx)
-            + data[i10 + channel] as f32 * fx;
-        let bottom = data[i01 + channel] as f32 * (1.0 - fx)
-            + data[i11 + channel] as f32 * fx;
-        out[channel] = (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8;
-    }
+#[derive(Clone, Copy)]
+struct BilinearXSample {
+    x0: usize,
+    x1: usize,
+    fx: f32,
 }
 
 fn composite_tile_region(
@@ -307,17 +287,24 @@ fn composite_tile_region(
     raster_scale: f32,
     zoom: f32,
     pan: [f32; 2],
+    x_samples: &mut Vec<BilinearXSample>,
 ) {
     let tile_left = coord.x as f32 * tile_world_size * zoom + pan[0];
     let tile_top = coord.y as f32 * tile_world_size * zoom + pan[1];
     let tile_right = tile_left + tile_world_size * zoom;
     let tile_bottom = tile_top + tile_world_size * zoom;
 
-    // Pixel centres are used so adjacent tiles neither overlap nor leave gaps.
+    // Calculate the destination pixel region covered by this tile.
     let x0 = (tile_left - 0.5).ceil().max(clip.x0 as f32).max(0.0) as u32;
     let y0 = (tile_top - 0.5).ceil().max(clip.y0 as f32).max(0.0) as u32;
-    let x1 = (tile_right - 0.5).ceil().min(clip.x1 as f32).min(destination.width() as f32) as u32;
-    let y1 = (tile_bottom - 0.5).ceil().min(clip.y1 as f32).min(destination.height() as f32) as u32;
+    let x1 = (tile_right - 0.5)
+        .ceil()
+        .min(clip.x1 as f32)
+        .min(destination.width() as f32) as u32;
+    let y1 = (tile_bottom - 0.5)
+        .ceil()
+        .min(clip.y1 as f32)
+        .min(destination.height() as f32) as u32;
 
     if x0 >= x1 || y0 >= y1 {
         return;
@@ -325,19 +312,94 @@ fn composite_tile_region(
 
     let source_width = source.width() as usize;
     let source_height = source.height() as usize;
-    let source_data = source.data();
     let destination_width = destination.width() as usize;
+
+    let source_stride = source_width * 4;
+    let destination_stride = destination_width * 4;
+
+    let source_data = source.data();
     let destination_data = destination.data_mut();
+
     let gutter = TILE_GUTTER_PX as f32;
 
-    let mut rgba = [0u8; 4];
+    let max_source_x = source_width.saturating_sub(1) as f32;
+    let max_source_y = source_height.saturating_sub(1) as f32;
+
+    // ---------------------------------------------------------
+    // Precalculate horizontal sampling coordinates.
+    //
+    // These coordinates are identical for every destination row,
+    // so we only need to calculate them once per tile.
+    // ---------------------------------------------------------
+
+    x_samples.clear();
+
+    let sample_count = (x1 - x0) as usize;
+    x_samples.reserve(sample_count);
+
+    for x in x0..x1 {
+        let source_x = ((x as f32 + 0.5 - tile_left) / zoom) * raster_scale + gutter - 0.5;
+
+        let source_x = source_x.clamp(0.0, max_source_x);
+
+        let sx0 = source_x.floor() as usize;
+        let sx1 = (sx0 + 1).min(source_width - 1);
+
+        x_samples.push(BilinearXSample {
+            x0: sx0 * 4,
+            x1: sx1 * 4,
+            fx: source_x - sx0 as f32,
+        });
+    }
+
+    // ---------------------------------------------------------
+    // Composite each destination row.
+    // ---------------------------------------------------------
+
     for y in y0..y1 {
         let source_y = ((y as f32 + 0.5 - tile_top) / zoom) * raster_scale + gutter - 0.5;
-        for x in x0..x1 {
-            let source_x = ((x as f32 + 0.5 - tile_left) / zoom) * raster_scale + gutter - 0.5;
-            sample_bilinear_rgba(source_data, source_width, source_height, source_x, source_y, &mut rgba);
-            let destination_index = (y as usize * destination_width + x as usize) * 4;
-            destination_data[destination_index..destination_index + 4].copy_from_slice(&rgba);
+
+        let source_y = source_y.clamp(0.0, max_source_y);
+
+        let sy0 = source_y.floor() as usize;
+        let sy1 = (sy0 + 1).min(source_height - 1);
+
+        let fy = source_y - sy0 as f32;
+        let inv_fy = 1.0 - fy;
+
+        // Obtain contiguous source row slices.
+        let row0_start = sy0 * source_stride;
+        let row1_start = sy1 * source_stride;
+
+        let row0 = &source_data[row0_start..row0_start + source_stride];
+        let row1 = &source_data[row1_start..row1_start + source_stride];
+
+        // Obtain the contiguous destination row slice.
+        let destination_start = y as usize * destination_stride + x0 as usize * 4;
+
+        let destination_end = destination_start + sample_count * 4;
+
+        let destination_row = &mut destination_data[destination_start..destination_end];
+
+        // Bilinear interpolation.
+        for (dst, sample) in destination_row.chunks_exact_mut(4).zip(x_samples.iter()) {
+            let fx = sample.fx;
+            let inv_fx = 1.0 - fx;
+
+            let sx0 = sample.x0;
+            let sx1 = sample.x1;
+
+            // Interpolate RGB only. Tile alpha is always 255.
+            for channel in 0..3 {
+                let top = row0[sx0 + channel] as f32 * inv_fx + row0[sx1 + channel] as f32 * fx;
+
+                let bottom = row1[sx0 + channel] as f32 * inv_fx + row1[sx1 + channel] as f32 * fx;
+
+                dst[channel] = (top * inv_fy + bottom * fy).round().clamp(0.0, 255.0) as u8;
+            }
+
+            // Preserve fully opaque output.
+            dst[3] = 255;
         }
     }
 }
@@ -403,23 +465,14 @@ fn point_to_segment_distance_squared(point: [f32; 2], start: [f32; 2], end: [f32
 }
 
 fn midpoint(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
-    [
-        (a[0] + b[0]) * 0.5,
-        (a[1] + b[1]) * 0.5,
-    ]
+    [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5]
 }
 
 fn orientation(a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> f32 {
-    (b[0] - a[0]) * (c[1] - a[1])
-        - (b[1] - a[1]) * (c[0] - a[0])
+    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
 }
 
-fn segments_intersect(
-    a: [f32; 2],
-    b: [f32; 2],
-    c: [f32; 2],
-    d: [f32; 2],
-) -> bool {
+fn segments_intersect(a: [f32; 2], b: [f32; 2], c: [f32; 2], d: [f32; 2]) -> bool {
     const EPSILON: f32 = 1e-6;
 
     let o1 = orientation(a, b, c);
@@ -427,11 +480,8 @@ fn segments_intersect(
     let o3 = orientation(c, d, a);
     let o4 = orientation(c, d, b);
 
-    let proper_intersection =
-        ((o1 > EPSILON && o2 < -EPSILON)
-            || (o1 < -EPSILON && o2 > EPSILON))
-        && ((o3 > EPSILON && o4 < -EPSILON)
-            || (o3 < -EPSILON && o4 > EPSILON));
+    let proper_intersection = ((o1 > EPSILON && o2 < -EPSILON) || (o1 < -EPSILON && o2 > EPSILON))
+        && ((o3 > EPSILON && o4 < -EPSILON) || (o3 < -EPSILON && o4 > EPSILON));
 
     if proper_intersection {
         return true;
@@ -450,12 +500,7 @@ fn segments_intersect(
         || (o4.abs() <= EPSILON && on_segment(b, c, d))
 }
 
-fn segment_to_segment_distance_squared(
-    a: [f32; 2],
-    b: [f32; 2],
-    c: [f32; 2],
-    d: [f32; 2],
-) -> f32 {
+fn segment_to_segment_distance_squared(a: [f32; 2], b: [f32; 2], c: [f32; 2], d: [f32; 2]) -> f32 {
     if segments_intersect(a, b, c, d) {
         return 0.0;
     }
@@ -485,19 +530,13 @@ fn cubic_touched_by_eraser(
     let deviation = deviation_sq.sqrt();
 
     // If sufficiently flat, approximate the curve with one line.
-    if deviation <= flatness_tolerance
-        || depth >= ERASER_MAX_SUBDIVISION_DEPTH
-    {
+    if deviation <= flatness_tolerance || depth >= ERASER_MAX_SUBDIVISION_DEPTH {
         // Expand the hit radius by the approximation error.
         // This avoids missing intersections due to flattening.
         let allowed_radius = hit_radius + deviation;
 
-        return segment_to_segment_distance_squared(
-            p0,
-            p3,
-            eraser_from,
-            eraser_to,
-        ) <= allowed_radius * allowed_radius;
+        return segment_to_segment_distance_squared(p0, p3, eraser_from, eraser_to)
+            <= allowed_radius * allowed_radius;
     }
 
     // Subdivide using De Casteljau's algorithm.
@@ -924,12 +963,13 @@ impl MathCanvasApp {
     fn unregister_stroke_from_tiles(&mut self, stroke_id: u64) {
         if let Some(coords) = self.tile_cache.tiles_by_stroke.remove(&stroke_id) {
             for coord in coords {
-                let remove_entry = if let Some(ids) = self.tile_cache.stroke_ids_by_tile.get_mut(&coord) {
-                    ids.retain(|id| *id != stroke_id);
-                    ids.is_empty()
-                } else {
-                    false
-                };
+                let remove_entry =
+                    if let Some(ids) = self.tile_cache.stroke_ids_by_tile.get_mut(&coord) {
+                        ids.retain(|id| *id != stroke_id);
+                        ids.is_empty()
+                    } else {
+                        false
+                    };
                 if remove_entry {
                     self.tile_cache.stroke_ids_by_tile.remove(&coord);
                 }
@@ -975,10 +1015,9 @@ impl MathCanvasApp {
             let Some(&index) = self.stroke_id_to_index.get(&stroke_id) else {
                 continue;
             };
-            if let (Some(stroke), Some(path)) = (
-                self.strokes.get(index),
-                self.stroke_cache.paths.get(index),
-            ) {
+            if let (Some(stroke), Some(path)) =
+                (self.strokes.get(index), self.stroke_cache.paths.get(index))
+            {
                 stroke.draw_to_pixmap(path, &mut pixmap, transform);
             }
         }
@@ -1054,6 +1093,9 @@ impl MathCanvasApp {
         let raster_scale = self.tile_cache.raster_scale;
         let zoom = self.zoom;
         let pan = self.pan;
+
+        let mut x_samples = Vec::new();
+
         if let Some(destination) = self.frame_pixmap.as_mut() {
             // Restore the region to the opaque canvas background first. This
             // also clears old strokes and temporary preview pixels after edits.
@@ -1079,6 +1121,7 @@ impl MathCanvasApp {
                         raster_scale,
                         zoom,
                         pan,
+                        &mut x_samples,
                     );
                 }
             }
@@ -1150,9 +1193,7 @@ impl MathCanvasApp {
             let src_row = data[source_start..source_end].chunks_exact(4);
 
             for (dst, src) in dst_row.iter_mut().zip(src_row) {
-                let pixel = ((src[0] as u32) << 16)
-                    | ((src[1] as u32) << 8)
-                    | (src[2] as u32);
+                let pixel = ((src[0] as u32) << 16) | ((src[1] as u32) << 8) | (src[2] as u32);
 
                 *dst = if invert {
                     pixel ^ RGB_INVERT_MASK
@@ -1498,16 +1539,12 @@ impl MathCanvasApp {
                 continue;
             };
             let stroke = &self.strokes[index];
-            if stroke_touched_by_eraser(
-                stroke,
-                from,
-                to,
-                eraser_radius,
-                flatness_tolerance,
-            ) {
+            if stroke_touched_by_eraser(stroke, from, to, eraser_radius, flatness_tolerance) {
                 removed_ids.insert(stroke_id);
                 if let Some(stroke_damage) = self.screen_damage_for_world_bounds(stroke.bounds) {
-                    damage = Some(damage.map_or(stroke_damage, |rect: PixelRect| rect.union(stroke_damage)));
+                    damage = Some(
+                        damage.map_or(stroke_damage, |rect: PixelRect| rect.union(stroke_damage)),
+                    );
                 }
             }
         }
@@ -1941,7 +1978,9 @@ impl ApplicationHandler for MathCanvasApp {
                                 self.unregister_stroke_from_tiles(stroke_id);
                             }
                             self.rebuild_stroke_id_to_index();
-                            if let Some(damage) = self.screen_damage_for_world_bounds(removed_stroke.bounds) {
+                            if let Some(damage) =
+                                self.screen_damage_for_world_bounds(removed_stroke.bounds)
+                            {
                                 self.add_pending_tile_damage(damage);
                             }
 
@@ -2055,7 +2094,8 @@ impl ApplicationHandler for MathCanvasApp {
                                 self.strokes.push(stroke);
                                 self.stroke_cache.paths.push(path);
                                 self.stroke_ids.push(stroke_id);
-                                self.stroke_id_to_index.insert(stroke_id, self.strokes.len() - 1);
+                                self.stroke_id_to_index
+                                    .insert(stroke_id, self.strokes.len() - 1);
                                 self.register_stroke_in_tiles(stroke_id, bounds);
                                 commit_succeeded = true;
                             }
