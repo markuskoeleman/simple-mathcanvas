@@ -1,0 +1,2268 @@
+use serde::{Deserialize, Serialize};
+use softbuffer::{Context, Rect, Surface};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::num::NonZeroU32;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+use tiny_skia::{Color, Paint, Path, PathBuilder, Pixmap, Stroke as SkiaStroke, Transform};
+use winit::application::ApplicationHandler;
+use winit::cursor::{Cursor, CustomCursorSource};
+use winit::dpi::PhysicalPosition;
+use winit::event::{
+    ButtonSource, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent,
+};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::Key;
+use winit::window::{Window, WindowAttributes, WindowId};
+
+// Controls the density and smoothness of captured handwriting.
+// Sampling distance is measured in screen pixels, keeping input
+// consistent across zoom levels. The simplification ratio determines
+// how aggressively redundant points are removed when a stroke is
+// committed. Its tolerance is also converted to world space using
+// the current zoom level.
+const STROKE_SAMPLE_DISTANCE_PX: f32 = 2.0;
+const STROKE_SIMPLIFICATION_RATIO: f32 = 0.5;
+
+const ERASER_FLATNESS_PX: f32 = 0.75;
+const ERASER_MAX_SUBDIVISION_DEPTH: u32 = 12;
+
+const DEFAULT_STROKE_WIDTH: f32 = 2.2;
+const DEFAULT_STROKE_COLOR: [u8; 4] = [255, 255, 255, 255];
+
+// Maximum frequency for full-frame pan/zoom preview redraws.
+const INTERACTIVE_FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // ~60 FPS
+
+// xor colors to invert them
+const RGB_INVERT_MASK: u32 = 0x00FF_FFFF;
+
+// How long scrolling must stop before committing the final vector rendering.
+const ZOOM_SETTLE_DELAY: Duration = Duration::from_millis(180);
+
+// World-aligned CPU raster tiles. Raster tiles are cached independently for
+// each quantised zoom level; the spatial index below uses a separate fixed
+// world-space grid and is therefore unaffected by zoom changes.
+const TILE_SIZE_PX: u32 = 512;
+const SPATIAL_CELL_WORLD_SIZE: f32 = 512.0;
+// Enough raster padding for the current 2.2-world-unit brush at maximum zoom
+// (including antialiasing). Increase this if much wider brushes are introduced.
+const TILE_GUTTER_PX: u32 = 32;
+const TILE_BITMAP_SIZE: u32 = TILE_SIZE_PX + TILE_GUTTER_PX * 2;
+// Bound the raster cache by memory rather than tile count. A 512px tile with
+// 32px gutters on every side occupies about 1.27 MiB (RGBA8).
+const MAX_TILE_CACHE_BYTES: usize = 128 * 1024 * 1024;
+const TILE_BITMAP_BYTES: usize = TILE_BITMAP_SIZE as usize * TILE_BITMAP_SIZE as usize * 4;
+
+// Keep disjoint damage regions separate, but bound history and per-frame work.
+const MAX_DAMAGE_RECTS: usize = 24;
+
+// --- Serializable Vector Data Model ---
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CubicSegment {
+    pub ctrl1: [f32; 2],
+    pub ctrl2: [f32; 2],
+    pub end: [f32; 2],
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct VectorStroke {
+    pub bounds: [f32; 4], // [min_x, min_y, max_x, max_y] in world space
+    pub width: f32,
+    pub color: [u8; 4],
+    pub start: [f32; 2],
+    pub segments: Vec<CubicSegment>,
+}
+
+impl VectorStroke {
+    pub fn from_raw_points(
+        raw: &[[f32; 2]],
+        width: f32,
+        color: [u8; 4],
+        epsilon: f32,
+    ) -> Option<Self> {
+        if raw.is_empty() {
+            return None;
+        }
+        let pts = rdp_simplify(raw, epsilon);
+        if pts.len() == 1 {
+            let p = pts[0];
+            return Some(Self {
+                bounds: [p[0] - width, p[1] - width, p[0] + width, p[1] + width],
+                width,
+                color,
+                start: p,
+                segments: vec![CubicSegment {
+                    ctrl1: p,
+                    ctrl2: p,
+                    end: [p[0] + 0.01, p[1] + 0.01],
+                }],
+            });
+        }
+
+        // Preserve sharp corners (> 65 degrees) for math symbols (+, =, sqrt)
+        let mut corners = vec![0];
+        for i in 1..pts.len() - 1 {
+            let v1 = [pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]];
+            let v2 = [pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]];
+            let len1 = (v1[0] * v1[0] + v1[1] * v1[1]).sqrt();
+            let len2 = (v2[0] * v2[0] + v2[1] * v2[1]).sqrt();
+            if len1 > 1e-4 && len2 > 1e-4 {
+                let cos_angle = ((v1[0] * v2[0] + v1[1] * v2[1]) / (len1 * len2)).clamp(-1.0, 1.0);
+                if cos_angle.acos() > 65.0_f32.to_radians() {
+                    corners.push(i);
+                }
+            }
+        }
+        corners.push(pts.len() - 1);
+
+        let mut segments = Vec::new();
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+
+        for p in &pts {
+            min_x = min_x.min(p[0]);
+            min_y = min_y.min(p[1]);
+            max_x = max_x.max(p[0]);
+            max_y = max_y.max(p[1]);
+        }
+
+        for pair in corners.windows(2) {
+            let sub = &pts[pair[0]..=pair[1]];
+            for i in 0..sub.len() - 1 {
+                let p0 = if i == 0 { sub[0] } else { sub[i - 1] };
+                let p1 = sub[i];
+                let p2 = sub[i + 1];
+                let p3 = if i + 2 >= sub.len() {
+                    sub[i + 1]
+                } else {
+                    sub[i + 2]
+                };
+
+                let ctrl1 = [p1[0] + (p2[0] - p0[0]) / 6.0, p1[1] + (p2[1] - p0[1]) / 6.0];
+                let ctrl2 = [p2[0] - (p3[0] - p1[0]) / 6.0, p2[1] - (p3[1] - p1[1]) / 6.0];
+
+                for c in [ctrl1, ctrl2, p2] {
+                    min_x = min_x.min(c[0]);
+                    min_y = min_y.min(c[1]);
+                    max_x = max_x.max(c[0]);
+                    max_y = max_y.max(c[1]);
+                }
+
+                segments.push(CubicSegment {
+                    ctrl1,
+                    ctrl2,
+                    end: p2,
+                });
+            }
+        }
+
+        let pad = width * 1.5;
+        Some(Self {
+            bounds: [min_x - pad, min_y - pad, max_x + pad, max_y + pad],
+            width,
+            color,
+            start: pts[0],
+            segments,
+        })
+    }
+
+    fn build_render_path(&self) -> Option<Path> {
+        let mut pb = PathBuilder::new();
+
+        pb.move_to(self.start[0], self.start[1]);
+
+        for seg in &self.segments {
+            pb.cubic_to(
+                seg.ctrl1[0],
+                seg.ctrl1[1],
+                seg.ctrl2[0],
+                seg.ctrl2[1],
+                seg.end[0],
+                seg.end[1],
+            );
+        }
+
+        pb.finish()
+    }
+
+    fn draw_to_pixmap(&self, path: &Path, pixmap: &mut Pixmap, transform: Transform) {
+        let mut paint = Paint::default();
+
+        paint.set_color_rgba8(self.color[0], self.color[1], self.color[2], self.color[3]);
+
+        paint.anti_alias = true;
+
+        let stroke = SkiaStroke {
+            width: self.width,
+            line_cap: tiny_skia::LineCap::Round,
+            line_join: tiny_skia::LineJoin::Round,
+            ..Default::default()
+        };
+
+        pixmap.stroke_path(path, &paint, &stroke, transform, None);
+    }
+}
+
+// --- Runtime Rendering Cache ---
+//
+// Stores generated tiny-skia paths separately from the document geometry.
+// Paths are generated once when strokes are committed and reused during
+// subsequent cache rebuilds. This data is temporary and never serialized.
+
+#[derive(Default)]
+struct StrokeRenderCache {
+    paths: Vec<Path>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TileCoord {
+    x: i32,
+    y: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct RasterTileKey {
+    level: i32,
+    coord: TileCoord,
+}
+
+struct CachedTile {
+    pixmap: Pixmap,
+    last_used: u64,
+}
+
+struct TileRenderCache {
+    // Fixed world-space spatial grid, independent of raster zoom level.
+    spatial_index_built: bool,
+    stroke_ids_by_cell: HashMap<TileCoord, Vec<u64>>,
+    cells_by_stroke: HashMap<u64, Vec<TileCoord>>,
+    // Raster tiles from multiple zoom levels coexist in this LRU cache.
+    rendered_tiles: HashMap<RasterTileKey, CachedTile>,
+    usage_clock: u64,
+}
+
+impl Default for TileRenderCache {
+    fn default() -> Self {
+        Self {
+            spatial_index_built: false,
+            stroke_ids_by_cell: HashMap::new(),
+            cells_by_stroke: HashMap::new(),
+            rendered_tiles: HashMap::new(),
+            usage_clock: 0,
+        }
+    }
+}
+
+fn tile_zoom_level(zoom: f32) -> i32 {
+    // Four levels per octave keep tile resampling within about 9% of native scale.
+    (zoom.max(0.0001).log2() * 4.0).round() as i32
+}
+
+fn tile_coords_for_bounds(bounds: [f32; 4], world_size: f32, gutter_world: f32) -> Vec<TileCoord> {
+    let min_x = ((bounds[0] - gutter_world) / world_size).floor() as i32;
+    let min_y = ((bounds[1] - gutter_world) / world_size).floor() as i32;
+    let max_x = ((bounds[2] + gutter_world) / world_size).floor() as i32;
+    let max_y = ((bounds[3] + gutter_world) / world_size).floor() as i32;
+
+    let mut coords = Vec::new();
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            coords.push(TileCoord { x, y });
+        }
+    }
+    coords
+}
+
+fn tile_transform(coord: TileCoord, raster_scale: f32) -> Transform {
+    // World -> tile-local pixels. The gutter allows antialiasing to extend
+    // across tile boundaries without creating visible seams.
+    Transform::from_scale(raster_scale, raster_scale).post_translate(
+        TILE_GUTTER_PX as f32 - coord.x as f32 * TILE_SIZE_PX as f32,
+        TILE_GUTTER_PX as f32 - coord.y as f32 * TILE_SIZE_PX as f32,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct BilinearXSample {
+    x0: usize,
+    x1: usize,
+    fx: f32,
+}
+
+fn composite_tile_region(
+    destination: &mut Pixmap,
+    source: &Pixmap,
+    coord: TileCoord,
+    clip: PixelRect,
+    tile_world_size: f32,
+    raster_scale: f32,
+    zoom: f32,
+    pan: [f32; 2],
+    x_samples: &mut Vec<BilinearXSample>,
+) {
+    let tile_left = coord.x as f32 * tile_world_size * zoom + pan[0];
+    let tile_top = coord.y as f32 * tile_world_size * zoom + pan[1];
+    let tile_right = tile_left + tile_world_size * zoom;
+    let tile_bottom = tile_top + tile_world_size * zoom;
+
+    // Calculate the destination pixel region covered by this tile.
+    let x0 = (tile_left - 0.5).ceil().max(clip.x0 as f32).max(0.0) as u32;
+    let y0 = (tile_top - 0.5).ceil().max(clip.y0 as f32).max(0.0) as u32;
+    let x1 = (tile_right - 0.5)
+        .ceil()
+        .min(clip.x1 as f32)
+        .min(destination.width() as f32) as u32;
+    let y1 = (tile_bottom - 0.5)
+        .ceil()
+        .min(clip.y1 as f32)
+        .min(destination.height() as f32) as u32;
+
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+
+    let source_width = source.width() as usize;
+    let source_height = source.height() as usize;
+    let destination_stride = destination.width() as usize * 4;
+    let source_stride = source_width * 4;
+    let source_data = source.data();
+    let destination_data = destination.data_mut();
+    let gutter = TILE_GUTTER_PX as f32;
+    let max_source_x = source_width.saturating_sub(1) as f32;
+    let max_source_y = source_height.saturating_sub(1) as f32;
+
+    // Horizontal sampling coordinates are shared by every row of this tile.
+    x_samples.clear();
+    let sample_count = (x1 - x0) as usize;
+    x_samples.reserve(sample_count);
+
+    for x in x0..x1 {
+        let source_x = ((x as f32 + 0.5 - tile_left) / zoom) * raster_scale + gutter - 0.5;
+        let source_x = source_x.clamp(0.0, max_source_x);
+        let sx0 = source_x.floor() as usize;
+        let sx1 = (sx0 + 1).min(source_width - 1);
+        x_samples.push(BilinearXSample {
+            x0: sx0 * 4,
+            x1: sx1 * 4,
+            fx: source_x - sx0 as f32,
+        });
+    }
+
+    for y in y0..y1 {
+        let source_y = ((y as f32 + 0.5 - tile_top) / zoom) * raster_scale + gutter - 0.5;
+        let source_y = source_y.clamp(0.0, max_source_y);
+        let sy0 = source_y.floor() as usize;
+        let sy1 = (sy0 + 1).min(source_height - 1);
+        let fy = source_y - sy0 as f32;
+        let inv_fy = 1.0 - fy;
+
+        let row0_start = sy0 * source_stride;
+        let row1_start = sy1 * source_stride;
+        let row0 = &source_data[row0_start..row0_start + source_stride];
+        let row1 = &source_data[row1_start..row1_start + source_stride];
+
+        let destination_start = y as usize * destination_stride + x0 as usize * 4;
+        let destination_end = destination_start + sample_count * 4;
+        let destination_row = &mut destination_data[destination_start..destination_end];
+
+        for (dst, sample) in destination_row
+            .chunks_exact_mut(4)
+            .zip(x_samples.iter())
+        {
+            let fx = sample.fx;
+            let inv_fx = 1.0 - fx;
+            let sx0 = sample.x0;
+            let sx1 = sample.x1;
+            let mut rgb = [0u8; 3];
+
+            for channel in 0..3 {
+                let top = row0[sx0 + channel] as f32 * inv_fx
+                    + row0[sx1 + channel] as f32 * fx;
+                let bottom = row1[sx0 + channel] as f32 * inv_fx
+                    + row1[sx1 + channel] as f32 * fx;
+                rgb[channel] = (top * inv_fy + bottom * fy)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+
+            dst[0] = rgb[0];
+            dst[1] = rgb[1];
+            dst[2] = rgb[2];
+            dst[3] = 255;
+        }
+    }
+}
+
+fn rdp_simplify(pts: &[[f32; 2]], epsilon: f32) -> Vec<[f32; 2]> {
+    if pts.len() < 3 {
+        return pts.to_vec();
+    }
+    let first = pts[0];
+    let last = pts[pts.len() - 1];
+    let mut max_dist = 0.0;
+    let mut index = 0;
+
+    let dx = last[0] - first[0];
+    let dy = last[1] - first[1];
+    let len_sq = dx * dx + dy * dy;
+
+    for (i, p) in pts.iter().enumerate().take(pts.len() - 1).skip(1) {
+        let dist = if len_sq < 1e-6 {
+            ((p[0] - first[0]).powi(2) + (p[1] - first[1]).powi(2)).sqrt()
+        } else {
+            let t = (((p[0] - first[0]) * dx + (p[1] - first[1]) * dy) / len_sq).clamp(0.0, 1.0);
+            let proj_x = first[0] + t * dx;
+            let proj_y = first[1] + t * dy;
+            ((p[0] - proj_x).powi(2) + (p[1] - proj_y).powi(2)).sqrt()
+        };
+        if dist > max_dist {
+            max_dist = dist;
+            index = i;
+        }
+    }
+
+    if max_dist > epsilon {
+        let mut left = rdp_simplify(&pts[..=index], epsilon);
+        let right = rdp_simplify(&pts[index..], epsilon);
+        left.pop();
+        left.extend(right);
+        left
+    } else {
+        vec![first, last]
+    }
+}
+
+fn point_to_segment_distance_squared(point: [f32; 2], start: [f32; 2], end: [f32; 2]) -> f32 {
+    let dx = end[0] - start[0];
+    let dy = end[1] - start[1];
+
+    let len_sq = dx * dx + dy * dy;
+
+    let t = if len_sq > 1e-6 {
+        (((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / len_sq).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    let closest_x = start[0] + t * dx;
+    let closest_y = start[1] + t * dy;
+
+    let diff_x = point[0] - closest_x;
+    let diff_y = point[1] - closest_y;
+
+    diff_x * diff_x + diff_y * diff_y
+}
+
+fn midpoint(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
+    [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5]
+}
+
+fn orientation(a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> f32 {
+    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+}
+
+fn segments_intersect(a: [f32; 2], b: [f32; 2], c: [f32; 2], d: [f32; 2]) -> bool {
+    const EPSILON: f32 = 1e-6;
+
+    let o1 = orientation(a, b, c);
+    let o2 = orientation(a, b, d);
+    let o3 = orientation(c, d, a);
+    let o4 = orientation(c, d, b);
+
+    let proper_intersection = ((o1 > EPSILON && o2 < -EPSILON) || (o1 < -EPSILON && o2 > EPSILON))
+        && ((o3 > EPSILON && o4 < -EPSILON) || (o3 < -EPSILON && o4 > EPSILON));
+
+    if proper_intersection {
+        return true;
+    }
+
+    fn on_segment(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> bool {
+        p[0] >= a[0].min(b[0]) - 1e-6
+            && p[0] <= a[0].max(b[0]) + 1e-6
+            && p[1] >= a[1].min(b[1]) - 1e-6
+            && p[1] <= a[1].max(b[1]) + 1e-6
+    }
+
+    (o1.abs() <= EPSILON && on_segment(c, a, b))
+        || (o2.abs() <= EPSILON && on_segment(d, a, b))
+        || (o3.abs() <= EPSILON && on_segment(a, c, d))
+        || (o4.abs() <= EPSILON && on_segment(b, c, d))
+}
+
+fn segment_to_segment_distance_squared(a: [f32; 2], b: [f32; 2], c: [f32; 2], d: [f32; 2]) -> f32 {
+    if segments_intersect(a, b, c, d) {
+        return 0.0;
+    }
+
+    point_to_segment_distance_squared(a, c, d)
+        .min(point_to_segment_distance_squared(b, c, d))
+        .min(point_to_segment_distance_squared(c, a, b))
+        .min(point_to_segment_distance_squared(d, a, b))
+}
+
+fn cubic_touched_by_eraser(
+    p0: [f32; 2],
+    p1: [f32; 2],
+    p2: [f32; 2],
+    p3: [f32; 2],
+    eraser_from: [f32; 2],
+    eraser_to: [f32; 2],
+    hit_radius: f32,
+    flatness_tolerance: f32,
+    depth: u32,
+) -> bool {
+    // Measure how far the control points deviate from
+    // the straight line connecting the curve's endpoints.
+    let deviation_sq = point_to_segment_distance_squared(p1, p0, p3)
+        .max(point_to_segment_distance_squared(p2, p0, p3));
+
+    let deviation = deviation_sq.sqrt();
+
+    // If sufficiently flat, approximate the curve with one line.
+    if deviation <= flatness_tolerance || depth >= ERASER_MAX_SUBDIVISION_DEPTH {
+        // Expand the hit radius by the approximation error.
+        // This avoids missing intersections due to flattening.
+        let allowed_radius = hit_radius + deviation;
+
+        return segment_to_segment_distance_squared(p0, p3, eraser_from, eraser_to)
+            <= allowed_radius * allowed_radius;
+    }
+
+    // Subdivide using De Casteljau's algorithm.
+    let p01 = midpoint(p0, p1);
+    let p12 = midpoint(p1, p2);
+    let p23 = midpoint(p2, p3);
+
+    let p012 = midpoint(p01, p12);
+    let p123 = midpoint(p12, p23);
+
+    let middle = midpoint(p012, p123);
+
+    // Check the first half. Stop immediately if it intersects.
+    if cubic_touched_by_eraser(
+        p0,
+        p01,
+        p012,
+        middle,
+        eraser_from,
+        eraser_to,
+        hit_radius,
+        flatness_tolerance,
+        depth + 1,
+    ) {
+        return true;
+    }
+
+    // Otherwise check the second half.
+    cubic_touched_by_eraser(
+        middle,
+        p123,
+        p23,
+        p3,
+        eraser_from,
+        eraser_to,
+        hit_radius,
+        flatness_tolerance,
+        depth + 1,
+    )
+}
+
+fn stroke_touched_by_eraser(
+    stroke: &VectorStroke,
+    from: [f32; 2],
+    to: [f32; 2],
+    eraser_radius: f32,
+    flatness_tolerance: f32,
+) -> bool {
+    let hit_radius = eraser_radius + stroke.width * 0.5;
+
+    // Broad-phase bounding-box rejection.
+    let min_x = from[0].min(to[0]) - eraser_radius;
+    let min_y = from[1].min(to[1]) - eraser_radius;
+    let max_x = from[0].max(to[0]) + eraser_radius;
+    let max_y = from[1].max(to[1]) + eraser_radius;
+
+    if stroke.bounds[2] < min_x
+        || stroke.bounds[0] > max_x
+        || stroke.bounds[3] < min_y
+        || stroke.bounds[1] > max_y
+    {
+        return false;
+    }
+
+    let mut curve_start = stroke.start;
+
+    for segment in &stroke.segments {
+        if cubic_touched_by_eraser(
+            curve_start,
+            segment.ctrl1,
+            segment.ctrl2,
+            segment.end,
+            from,
+            to,
+            hit_radius,
+            flatness_tolerance,
+            0,
+        ) {
+            return true;
+        }
+
+        curve_start = segment.end;
+    }
+
+    false
+}
+
+// A rectangle describing the portion of the framebuffer that changed.
+// Coordinates use exclusive maximum bounds: x1 and y1 are not included.
+#[derive(Clone, Copy, Debug)]
+struct PixelRect {
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+}
+
+impl PixelRect {
+    fn full(width: u32, height: u32) -> Self {
+        Self {
+            x0: 0,
+            y0: 0,
+            x1: width,
+            y1: height,
+        }
+    }
+
+    fn from_bounds(
+        min_x: f32,
+        min_y: f32,
+        max_x: f32,
+        max_y: f32,
+        padding: f32,
+        width: u32,
+        height: u32,
+    ) -> Option<Self> {
+        let x0 = (min_x - padding).floor().clamp(0.0, width as f32) as u32;
+        let y0 = (min_y - padding).floor().clamp(0.0, height as f32) as u32;
+        let x1 = (max_x + padding).ceil().clamp(0.0, width as f32) as u32;
+        let y1 = (max_y + padding).ceil().clamp(0.0, height as f32) as u32;
+
+        if x0 >= x1 || y0 >= y1 {
+            return None;
+        }
+
+        Some(Self { x0, y0, x1, y1 })
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            x0: self.x0.min(other.x0),
+            y0: self.y0.min(other.y0),
+            x1: self.x1.max(other.x1),
+            y1: self.y1.max(other.y1),
+        }
+    }
+
+    fn area(self) -> u64 {
+        (self.x1 - self.x0) as u64 * (self.y1 - self.y0) as u64
+    }
+
+    fn to_softbuffer_rect(self) -> Rect {
+        Rect {
+            x: self.x0,
+            y: self.y0,
+            width: NonZeroU32::new(self.x1 - self.x0).unwrap(),
+            height: NonZeroU32::new(self.y1 - self.y0).unwrap(),
+        }
+    }
+}
+
+// Insert one damaged rectangle while preserving spatial locality. Strongly
+// overlapping rectangles are coalesced; distant rectangles remain independent.
+// If the list reaches its fixed bound, merge the pair with the least extra area.
+fn add_damage_rect(rects: &mut Vec<PixelRect>, mut rect: PixelRect) {
+    let mut index = 0;
+    while index < rects.len() {
+        let existing = rects[index];
+        let union = existing.union(rect);
+        let largest_area = existing.area().max(rect.area());
+
+        // Merge duplicates/containment and close overlaps, but do not let a
+        // growing diagonal bounding box absorb every later segment.
+        if union.area() <= largest_area.saturating_add(largest_area / 4) {
+            rect = union;
+            rects.swap_remove(index);
+            index = 0;
+        } else {
+            index += 1;
+        }
+    }
+    rects.push(rect);
+
+    while rects.len() > MAX_DAMAGE_RECTS {
+        let mut best_pair = (0usize, 1usize);
+        let mut best_extra_area = u64::MAX;
+
+        for i in 0..rects.len() {
+            for j in i + 1..rects.len() {
+                let a = rects[i];
+                let b = rects[j];
+                let extra_area = a.union(b).area().saturating_sub(a.area().saturating_add(b.area()));
+                if extra_area < best_extra_area {
+                    best_extra_area = extra_area;
+                    best_pair = (i, j);
+                }
+            }
+        }
+
+        let (i, j) = best_pair;
+        let merged = rects[i].union(rects[j]);
+        rects.swap_remove(j);
+        rects.swap_remove(i);
+
+        // The merged rectangle may now overlap another nearby region.
+        let mut merged = merged;
+        let mut index = 0;
+        while index < rects.len() {
+            let existing = rects[index];
+            let union = existing.union(merged);
+            let largest_area = existing.area().max(merged.area());
+            if union.area() <= largest_area.saturating_add(largest_area / 4) {
+                merged = union;
+                rects.swap_remove(index);
+                index = 0;
+            } else {
+                index += 1;
+            }
+        }
+        rects.push(merged);
+    }
+}
+
+// Gesture state is represented by one mutually-exclusive mode. Data that only
+// exists during a gesture lives in that variant, so impossible combinations
+// (for example drawing and panning simultaneously) cannot be represented.
+#[derive(Default)]
+enum Interaction {
+    #[default]
+    Idle,
+    Drawing {
+        points: Vec<[f32; 2]>,
+        rendered: usize,
+    },
+    Erasing,
+    Panning {
+        origin: [f32; 2],
+        offset: [i32; 2],
+    },
+    Zooming {
+        origin_zoom: f32,
+        origin_pan: [f32; 2],
+        settle_at: Instant,
+    },
+}
+
+// Keyboard modifiers are independent inputs, not interaction modes: Shift,
+// Space and the tool key may legitimately be held in combination.
+#[derive(Default)]
+struct HeldInputs {
+    space: bool,
+    shift: bool,
+    erase: bool,
+    invert: bool,
+}
+
+// --- Application & Two-Stage Rendering State ---
+
+struct MathCanvasApp {
+    window: Option<Rc<dyn Window>>,
+    surface: Option<Surface<Rc<dyn Window>, Rc<dyn Window>>>,
+
+    frame_pixmap: Option<Pixmap>,
+
+    strokes: Vec<VectorStroke>,
+    stroke_cache: StrokeRenderCache,
+    // Stable IDs let tile membership survive vector removals/compaction.
+    stroke_ids: Vec<u64>,
+    stroke_id_to_index: HashMap<u64, usize>,
+    next_stroke_id: u64,
+    tile_cache: TileRenderCache,
+    pan: [f32; 2],
+    zoom: f32,
+
+    cursor_screen: PhysicalPosition<f64>,
+    interaction: Interaction,
+    inputs: HeldInputs,
+    invert_contrast: bool,
+
+    cache_dirty: bool,
+    // Tile invalidations expressed as a bounded list of viewport damage regions.
+    pending_tile_damage: Vec<PixelRect>,
+
+    // Interactive frame pacing
+    redraw_pending: bool,
+    event_batch_redraw_pending: bool,
+    next_frame_deadline: Option<Instant>,
+
+    // Regions modified since the last presentation.
+    pending_damage: Vec<PixelRect>,
+
+    // Damage regions for each prior presentation, needed for softbuffer buffer ages.
+    damage_history: VecDeque<Vec<PixelRect>>,
+
+    current_stroke_color: [u8; 4],
+    current_stroke_width: f32,
+}
+
+impl Default for MathCanvasApp {
+    fn default() -> Self {
+        Self {
+            window: None,
+            surface: None,
+            frame_pixmap: None,
+            strokes: Vec::new(),
+            stroke_cache: StrokeRenderCache::default(),
+            stroke_ids: Vec::new(),
+            stroke_id_to_index: HashMap::new(),
+            next_stroke_id: 1,
+            tile_cache: TileRenderCache::default(),
+            pan: [0.0, 0.0],
+            zoom: 1.0,
+            cursor_screen: PhysicalPosition::new(0.0, 0.0),
+            interaction: Interaction::Idle,
+            inputs: HeldInputs::default(),
+            invert_contrast: false,
+            cache_dirty: false,
+            pending_tile_damage: Vec::new(),
+
+            redraw_pending: false,
+            event_batch_redraw_pending: false,
+            next_frame_deadline: None,
+
+            pending_damage: Vec::new(),
+            damage_history: VecDeque::new(),
+
+            current_stroke_color: DEFAULT_STROKE_COLOR,
+            current_stroke_width: DEFAULT_STROKE_WIDTH,
+        }
+    }
+}
+
+impl MathCanvasApp {
+    fn camera_transform(&self) -> Transform {
+        Transform::from_scale(self.zoom, self.zoom).post_translate(self.pan[0], self.pan[1])
+    }
+
+    fn screen_to_world(&self, pos: PhysicalPosition<f64>) -> [f32; 2] {
+        [
+            (pos.x as f32 - self.pan[0]) / self.zoom,
+            (pos.y as f32 - self.pan[1]) / self.zoom,
+        ]
+    }
+
+    fn add_pending_tile_damage(&mut self, rect: PixelRect) {
+        add_damage_rect(&mut self.pending_tile_damage, rect);
+    }
+
+    fn refresh_pending_tile_damage(&mut self) {
+        if self.pending_tile_damage.is_empty() {
+            return;
+        }
+
+        let damages = std::mem::take(&mut self.pending_tile_damage);
+        // Recompose only the affected regions. Separate regions stay separate,
+        // which is important for long diagonal strokes and multi-stroke erases.
+        for damage in damages {
+            self.composite_tiles_into_frame(damage);
+        }
+        if let Interaction::Drawing { rendered, .. } = &mut self.interaction {
+            // Recomposition may have overwritten parts of the live preview.
+            *rendered = 1;
+        }
+    }
+
+    // Return compact screen-space damage rectangles for each Bézier segment.
+    // A cubic curve lies inside the convex hull of its endpoints/control points,
+    // so these bounds safely cover the rasterized stroke without using one huge
+    // page-spanning bounding box for a long diagonal.
+    fn stroke_damage_rects(&self, stroke: &VectorStroke) -> Vec<PixelRect> {
+        let Some(frame) = self.frame_pixmap.as_ref() else {
+            return Vec::new();
+        };
+        let mut damages = Vec::with_capacity(stroke.segments.len());
+        let padding = stroke.width * self.zoom * 0.5 + 2.0;
+        let mut curve_start = stroke.start;
+
+        for segment in &stroke.segments {
+            let min_x = curve_start[0]
+                .min(segment.ctrl1[0])
+                .min(segment.ctrl2[0])
+                .min(segment.end[0]);
+            let min_y = curve_start[1]
+                .min(segment.ctrl1[1])
+                .min(segment.ctrl2[1])
+                .min(segment.end[1]);
+            let max_x = curve_start[0]
+                .max(segment.ctrl1[0])
+                .max(segment.ctrl2[0])
+                .max(segment.end[0]);
+            let max_y = curve_start[1]
+                .max(segment.ctrl1[1])
+                .max(segment.ctrl2[1])
+                .max(segment.end[1]);
+
+            if let Some(rect) = PixelRect::from_bounds(
+                min_x * self.zoom + self.pan[0],
+                min_y * self.zoom + self.pan[1],
+                max_x * self.zoom + self.pan[0],
+                max_y * self.zoom + self.pan[1],
+                padding,
+                frame.width(),
+                frame.height(),
+            ) {
+                add_damage_rect(&mut damages, rect);
+            }
+            curve_start = segment.end;
+        }
+        damages
+    }
+
+    // Include the temporary polyline preview as well as the final smoothed
+    // Bézier path, so committing a stroke clears every preview pixel.
+    fn stroke_commit_damage_rects(
+        &self,
+        stroke: &VectorStroke,
+        preview_points: &[[f32; 2]],
+    ) -> Vec<PixelRect> {
+        let Some(frame) = self.frame_pixmap.as_ref() else {
+            return Vec::new();
+        };
+        let mut damages = self.stroke_damage_rects(stroke);
+        let padding = self.current_stroke_width * self.zoom * 0.5 + 2.0;
+
+        for pair in preview_points.windows(2) {
+            let a = pair[0];
+            let b = pair[1];
+            if let Some(rect) = PixelRect::from_bounds(
+                a[0].min(b[0]) * self.zoom + self.pan[0],
+                a[1].min(b[1]) * self.zoom + self.pan[1],
+                a[0].max(b[0]) * self.zoom + self.pan[0],
+                a[1].max(b[1]) * self.zoom + self.pan[1],
+                padding,
+                frame.width(),
+                frame.height(),
+            ) {
+                add_damage_rect(&mut damages, rect);
+            }
+        }
+        damages
+    }
+
+    fn ensure_spatial_index_current(&mut self) {
+        if self.tile_cache.spatial_index_built {
+            return;
+        }
+
+        self.tile_cache.stroke_ids_by_cell.clear();
+        self.tile_cache.cells_by_stroke.clear();
+
+        for (index, stroke) in self.strokes.iter().enumerate() {
+            let Some(&stroke_id) = self.stroke_ids.get(index) else {
+                continue;
+            };
+            let cells = tile_coords_for_bounds(
+                stroke.bounds,
+                SPATIAL_CELL_WORLD_SIZE,
+                0.0,
+            );
+            for cell in &cells {
+                self.tile_cache
+                    .stroke_ids_by_cell
+                    .entry(*cell)
+                    .or_default()
+                    .push(stroke_id);
+            }
+            self.tile_cache.cells_by_stroke.insert(stroke_id, cells);
+        }
+
+        self.tile_cache.spatial_index_built = true;
+    }
+
+    fn raster_scale_for_level(level: i32) -> f32 {
+        2.0_f32.powf(level as f32 * 0.25).max(0.0001)
+    }
+
+    fn rebuild_stroke_id_to_index(&mut self) {
+        self.stroke_id_to_index.clear();
+        self.stroke_id_to_index.reserve(self.stroke_ids.len());
+        for (index, stroke_id) in self.stroke_ids.iter().copied().enumerate() {
+            self.stroke_id_to_index.insert(stroke_id, index);
+        }
+    }
+
+    fn register_stroke_in_tiles(&mut self, stroke_id: u64, bounds: [f32; 4]) {
+        self.ensure_spatial_index_current();
+
+        // If the index was lazily built after this stroke entered the document,
+        // it already contains this ID. Otherwise, add it to the fixed grid now.
+        if !self.tile_cache.cells_by_stroke.contains_key(&stroke_id) {
+            let cells = tile_coords_for_bounds(bounds, SPATIAL_CELL_WORLD_SIZE, 0.0);
+            for cell in &cells {
+                self.tile_cache
+                    .stroke_ids_by_cell
+                    .entry(*cell)
+                    .or_default()
+                    .push(stroke_id);
+            }
+            self.tile_cache.cells_by_stroke.insert(stroke_id, cells);
+        }
+
+        // Existing raster tiles at any cached zoom level can be updated in
+        // place because the new stroke is topmost. Unrendered tiles stay lazy.
+        let Some(&index) = self.stroke_id_to_index.get(&stroke_id) else {
+            return;
+        };
+        let (Some(stroke), Some(path)) = (
+            self.strokes.get(index),
+            self.stroke_cache.paths.get(index),
+        ) else {
+            return;
+        };
+        self.tile_cache.usage_clock = self.tile_cache.usage_clock.wrapping_add(1);
+        let use_stamp = self.tile_cache.usage_clock;
+        let rendered_tiles = &mut self.tile_cache.rendered_tiles;
+
+        for (key, tile) in rendered_tiles.iter_mut() {
+            let raster_scale = Self::raster_scale_for_level(key.level);
+            let world_size = TILE_SIZE_PX as f32 / raster_scale;
+            let gutter_world = TILE_GUTTER_PX as f32 / raster_scale;
+            let touched = tile_coords_for_bounds(bounds, world_size, gutter_world);
+            if touched.contains(&key.coord) {
+                tile.last_used = use_stamp;
+                stroke.draw_to_pixmap(path, &mut tile.pixmap, tile_transform(key.coord, raster_scale));
+            }
+        }
+    }
+
+    fn unregister_stroke_from_tiles(&mut self, stroke_id: u64, bounds: [f32; 4]) {
+        if let Some(cells) = self.tile_cache.cells_by_stroke.remove(&stroke_id) {
+            for cell in cells {
+                let remove_entry =
+                    if let Some(ids) = self.tile_cache.stroke_ids_by_cell.get_mut(&cell) {
+                        ids.retain(|id| *id != stroke_id);
+                        ids.is_empty()
+                    } else {
+                        false
+                    };
+                if remove_entry {
+                    self.tile_cache.stroke_ids_by_cell.remove(&cell);
+                }
+            }
+        }
+
+        // A removed stroke cannot be unpainted. Invalidate only cached raster
+        // tiles intersecting its padded bounds, at every retained zoom level.
+        let affected: Vec<RasterTileKey> = self
+            .tile_cache
+            .rendered_tiles
+            .keys()
+            .copied()
+            .filter(|key| {
+                let raster_scale = Self::raster_scale_for_level(key.level);
+                let world_size = TILE_SIZE_PX as f32 / raster_scale;
+                let gutter_world = TILE_GUTTER_PX as f32 / raster_scale;
+                tile_coords_for_bounds(bounds, world_size, gutter_world).contains(&key.coord)
+            })
+            .collect();
+        for key in affected {
+            self.tile_cache.rendered_tiles.remove(&key);
+        }
+
+        self.stroke_id_to_index.remove(&stroke_id);
+    }
+
+    fn ensure_tile_rendered(&mut self, level: i32, coord: TileCoord) {
+        let key = RasterTileKey { level, coord };
+        self.tile_cache.usage_clock = self.tile_cache.usage_clock.wrapping_add(1);
+        let use_stamp = self.tile_cache.usage_clock;
+        if let Some(tile) = self.tile_cache.rendered_tiles.get_mut(&key) {
+            tile.last_used = use_stamp;
+            return;
+        }
+
+        let raster_scale = Self::raster_scale_for_level(level);
+        let world_size = TILE_SIZE_PX as f32 / raster_scale;
+        let gutter_world = TILE_GUTTER_PX as f32 / raster_scale;
+        let tile_bounds = [
+            coord.x as f32 * world_size - gutter_world,
+            coord.y as f32 * world_size - gutter_world,
+            (coord.x as f32 + 1.0) * world_size + gutter_world,
+            (coord.y as f32 + 1.0) * world_size + gutter_world,
+        ];
+
+        // Query the zoom-independent spatial grid for strokes intersecting
+        // this raster tile, then restore document order using stable IDs.
+        let spatial_cells = tile_coords_for_bounds(
+            tile_bounds,
+            SPATIAL_CELL_WORLD_SIZE,
+            0.0,
+        );
+        let mut stroke_ids = Vec::new();
+        for cell in spatial_cells {
+            if let Some(ids) = self.tile_cache.stroke_ids_by_cell.get(&cell) {
+                stroke_ids.extend(ids.iter().copied());
+            }
+        }
+        stroke_ids.sort_unstable();
+        stroke_ids.dedup();
+
+        if stroke_ids.is_empty() {
+            // Empty tiles are just the canvas background; do not allocate them.
+            return;
+        }
+
+        let mut pixmap = Pixmap::new(TILE_BITMAP_SIZE, TILE_BITMAP_SIZE)
+            .expect("failed to allocate canvas tile pixmap");
+        pixmap.fill(Color::from_rgba8(0, 0, 0, 255));
+        let transform = tile_transform(coord, raster_scale);
+
+        for stroke_id in stroke_ids {
+            let Some(&index) = self.stroke_id_to_index.get(&stroke_id) else {
+                continue;
+            };
+            if let (Some(stroke), Some(path)) =
+                (self.strokes.get(index), self.stroke_cache.paths.get(index))
+            {
+                stroke.draw_to_pixmap(path, &mut pixmap, transform);
+            }
+        }
+
+        self.tile_cache.rendered_tiles.insert(
+            key,
+            CachedTile {
+                pixmap,
+                last_used: use_stamp,
+            },
+        );
+    }
+
+    fn tile_coords_for_screen_rect(&self, rect: PixelRect, world_size: f32) -> Vec<TileCoord> {
+        let zoom = self.zoom;
+        let first_x = (rect.x0 as f32 + 0.5 - self.pan[0]) / zoom;
+        let first_y = (rect.y0 as f32 + 0.5 - self.pan[1]) / zoom;
+        let last_x = (rect.x1 as f32 - 0.5 - self.pan[0]) / zoom;
+        let last_y = (rect.y1 as f32 - 0.5 - self.pan[1]) / zoom;
+
+        let min_tx = (first_x.min(last_x) / world_size).floor() as i32;
+        let min_ty = (first_y.min(last_y) / world_size).floor() as i32;
+        let max_tx = (first_x.max(last_x) / world_size).floor() as i32;
+        let max_ty = (first_y.max(last_y) / world_size).floor() as i32;
+
+        let mut coords = Vec::new();
+        for y in min_ty..=max_ty {
+            for x in min_tx..=max_tx {
+                coords.push(TileCoord { x, y });
+            }
+        }
+        coords
+    }
+
+    fn evict_old_tiles(&mut self, visible: &HashSet<RasterTileKey>) {
+        let mut cached_bytes = self.tile_cache.rendered_tiles.len() * TILE_BITMAP_BYTES;
+
+        while cached_bytes > MAX_TILE_CACHE_BYTES {
+            let oldest = self
+                .tile_cache
+                .rendered_tiles
+                .iter()
+                .filter(|(key, _)| !visible.contains(*key))
+                .min_by_key(|(_, tile)| tile.last_used)
+                .map(|(key, _)| *key);
+            let Some(key) = oldest else {
+                // Keep all tiles needed for the current viewport, even if the
+                // visible set alone temporarily exceeds the soft memory cap.
+                break;
+            };
+            if self.tile_cache.rendered_tiles.remove(&key).is_some() {
+                cached_bytes = cached_bytes.saturating_sub(TILE_BITMAP_BYTES);
+            }
+        }
+    }
+
+    // Rebuild or composite only tiles intersecting a framebuffer rectangle.
+    // Tiles are written directly into the display pixmap; empty tiles remain
+    // implicit background and therefore consume no cached raster memory.
+
+    fn composite_tiles_into_frame(&mut self, rect: PixelRect) {
+        self.ensure_spatial_index_current();
+
+        let level = tile_zoom_level(self.zoom);
+        let raster_scale = Self::raster_scale_for_level(level);
+        let tile_world_size = TILE_SIZE_PX as f32 / raster_scale;
+        let visible_coords = self.tile_coords_for_screen_rect(rect, tile_world_size);
+
+        for coord in &visible_coords {
+            self.ensure_tile_rendered(level, *coord);
+        }
+
+        let zoom = self.zoom;
+        let pan = self.pan;
+        let frame_size = self
+            .frame_pixmap
+            .as_ref()
+            .map(|frame| (frame.width() as usize, frame.height() as usize));
+        let mut x_samples = Vec::new();
+
+        if let (Some(destination), Some((width, _))) = (self.frame_pixmap.as_mut(), frame_size) {
+            // Clear the damaged area to the canonical (non-inverted) background.
+            {
+                let destination_data = destination.data_mut();
+                const BACKGROUND_RGBA: [u8; 4] = [0, 0, 0, 255];
+                for y in rect.y0 as usize..rect.y1 as usize {
+                    let pixel_start = y * width + rect.x0 as usize;
+                    let pixel_end = y * width + rect.x1 as usize;
+                    let byte_start = pixel_start * 4;
+                    let byte_end = pixel_end * 4;
+                    for pixel in destination_data[byte_start..byte_end].chunks_exact_mut(4) {
+                        pixel.copy_from_slice(&BACKGROUND_RGBA);
+                    }
+                }
+            }
+
+            for coord in &visible_coords {
+                let key = RasterTileKey { level, coord: *coord };
+                if let Some(tile) = self.tile_cache.rendered_tiles.get(&key) {
+                    composite_tile_region(
+                        destination,
+                        &tile.pixmap,
+                        *coord,
+                        rect,
+                        tile_world_size,
+                        raster_scale,
+                        zoom,
+                        pan,
+                        &mut x_samples,
+                    );
+                }
+            }
+        }
+
+        if frame_size.is_some() {
+            self.add_pending_damage(rect);
+        }
+
+        // Protect the current viewport's keys while evicting the least-recently
+        // used cached rasters from any other zoom level.
+        let viewport = self
+            .frame_pixmap
+            .as_ref()
+            .map(|pixmap| PixelRect::full(pixmap.width(), pixmap.height()));
+        let visible_set: HashSet<RasterTileKey> = viewport
+            .map(|full| {
+                self.tile_coords_for_screen_rect(full, tile_world_size)
+                    .into_iter()
+                    .map(|coord| RasterTileKey { level, coord })
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                visible_coords
+                    .into_iter()
+                    .map(|coord| RasterTileKey { level, coord })
+                    .collect()
+            });
+        self.evict_old_tiles(&visible_set);
+    }
+
+    fn add_pending_damage(&mut self, rect: PixelRect) {
+        add_damage_rect(&mut self.pending_damage, rect);
+    }
+
+    fn render_pan_frame(&mut self) {
+        let invert = self.invert_contrast;
+        let background = if invert { RGB_INVERT_MASK } else { 0 };
+        let [dx, dy] = match &self.interaction {
+            Interaction::Panning { offset, .. } => *offset,
+            _ => return,
+        };
+
+        let Some(frame) = self.frame_pixmap.as_ref() else {
+            return;
+        };
+        let width = frame.width() as usize;
+        let height = frame.height() as usize;
+        let source = frame.data();
+
+        let Some(surface) = self.surface.as_mut() else {
+            return;
+        };
+        let Ok(mut buffer) = surface.buffer_mut() else {
+            return;
+        };
+        if buffer.len() != width * height {
+            return;
+        }
+
+        let dx = dx as i64;
+        let dy = dy as i64;
+        for y in 0..height {
+            let source_y = y as i64 - dy;
+            let destination_row = &mut buffer[y * width..(y + 1) * width];
+            if source_y < 0 || source_y >= height as i64 {
+                destination_row.fill(background);
+                continue;
+            }
+
+            let source_row_start = source_y as usize * width * 4;
+            for (x, destination_pixel) in destination_row.iter_mut().enumerate() {
+                let source_x = x as i64 - dx;
+                if source_x < 0 || source_x >= width as i64 {
+                    *destination_pixel = background;
+                    continue;
+                }
+
+                let source_index = source_row_start + source_x as usize * 4;
+                let pixel = ((source[source_index] as u32) << 16)
+                    | ((source[source_index + 1] as u32) << 8)
+                    | source[source_index + 2] as u32;
+                *destination_pixel = if invert { pixel ^ RGB_INVERT_MASK } else { pixel };
+            }
+        }
+
+        let _ = buffer.present();
+        self.damage_history.clear();
+        self.pending_damage.clear();
+        self.pending_damage.push(PixelRect::full(width as u32, height as u32));
+    }
+
+    fn render_zoom_frame(&mut self) {
+        let invert = self.invert_contrast;
+        let background = if invert { RGB_INVERT_MASK } else { 0 };
+        let zoom = self.zoom;
+        let pan = self.pan;
+        let (zoom_origin, pan_origin) = match &self.interaction {
+            Interaction::Zooming { origin_zoom, origin_pan, .. } => (*origin_zoom, *origin_pan),
+            _ => return,
+        };
+
+        let Some(frame) = self.frame_pixmap.as_ref() else {
+            return;
+        };
+        let width = frame.width() as usize;
+        let height = frame.height() as usize;
+        let source = frame.data();
+
+        let Some(surface) = self.surface.as_mut() else {
+            return;
+        };
+        let Ok(mut buffer) = surface.buffer_mut() else {
+            return;
+        };
+        if buffer.len() != width * height {
+            return;
+        }
+
+        let scale = zoom_origin / zoom;
+        for y in 0..height {
+            let source_y = ((y as f32 - pan[1]) * scale + pan_origin[1]).round() as i32;
+            let destination_row = &mut buffer[y * width..(y + 1) * width];
+            if source_y < 0 || source_y >= height as i32 {
+                destination_row.fill(background);
+                continue;
+            }
+
+            let source_row_start = source_y as usize * width * 4;
+            let mut source_x = (0.0 - pan[0]) * scale + pan_origin[0];
+            for destination_pixel in destination_row.iter_mut() {
+                let sx = source_x.round() as i32;
+                if sx < 0 || sx >= width as i32 {
+                    *destination_pixel = background;
+                } else {
+                    let source_index = source_row_start + sx as usize * 4;
+                    let pixel = ((source[source_index] as u32) << 16)
+                        | ((source[source_index + 1] as u32) << 8)
+                        | source[source_index + 2] as u32;
+                    *destination_pixel = if invert { pixel ^ RGB_INVERT_MASK } else { pixel };
+                }
+                source_x += scale;
+            }
+        }
+
+        let result = buffer.present();
+        if result.is_ok() {
+            let full = PixelRect::full(width as u32, height as u32);
+            self.damage_history.clear();
+            self.damage_history.push_back(vec![full]);
+            self.pending_damage.clear();
+        }
+    }
+
+    fn finish_zoom_interaction(&mut self, event_loop: &dyn ActiveEventLoop) {
+        let previous = std::mem::replace(&mut self.interaction, Interaction::Idle);
+        if !matches!(&previous, Interaction::Zooming { .. }) {
+            self.interaction = previous;
+            return;
+        }
+
+        // This is the single zoom-finalisation path, used by the settle timer
+        // and by input that begins another interaction before the timer fires.
+        self.cache_dirty = true;
+        self.ensure_frame_current();
+        self.update_brush_cursor(event_loop);
+        self.redraw_pending = false;
+        self.next_frame_deadline = None;
+    }
+
+    // Drawing and erasing request one redraw after the current event batch.
+    // This avoids imposing a fixed 60 Hz timer on pen input and naturally
+    // follows the platform's event cadence (including 120/144 Hz displays).
+    fn schedule_event_batch_redraw(&mut self) {
+        self.event_batch_redraw_pending = true;
+    }
+
+    // Camera previews are intentionally throttled to avoid excessive full-frame
+    // resampling while panning or zooming.
+    fn schedule_interactive_redraw(&mut self, event_loop: &dyn ActiveEventLoop) {
+        self.redraw_pending = true;
+        let deadline = self.next_frame_deadline.unwrap_or_else(Instant::now);
+        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+    }
+
+    fn ensure_frame_current(&mut self) {
+        if self.cache_dirty {
+            self.rebuild_frame_from_tiles();
+            self.cache_dirty = false;
+            self.pending_tile_damage.clear();
+        } else {
+            self.refresh_pending_tile_damage();
+        }
+    }
+
+    fn draw_pending_preview_segments(&mut self) -> Vec<PixelRect> {
+        let (frame_width, frame_height) = match self.frame_pixmap.as_ref() {
+            Some(frame) => (frame.width(), frame.height()),
+            None => return Vec::new(),
+        };
+        let color = self.current_stroke_color;
+        let width = self.current_stroke_width;
+        let padding = width * self.zoom * 0.5 + 2.0;
+        let zoom = self.zoom;
+        let pan = self.pan;
+        let transform = self.camera_transform();
+
+        let (damages, path) = {
+            let Interaction::Drawing { points, rendered } = &mut self.interaction else {
+                return Vec::new();
+            };
+            let total = points.len();
+            if *rendered == 0 || total <= *rendered {
+                return Vec::new();
+            }
+
+            let first_new = *rendered;
+            let mut damages = Vec::with_capacity(total - first_new);
+            let mut previous = points[first_new - 1];
+            for &point in &points[first_new..] {
+                if let Some(rect) = PixelRect::from_bounds(
+                    previous[0].min(point[0]) * zoom + pan[0],
+                    previous[1].min(point[1]) * zoom + pan[1],
+                    previous[0].max(point[0]) * zoom + pan[0],
+                    previous[1].max(point[1]) * zoom + pan[1],
+                    padding,
+                    frame_width,
+                    frame_height,
+                ) {
+                    add_damage_rect(&mut damages, rect);
+                }
+                previous = point;
+            }
+
+            let mut pb = PathBuilder::new();
+            let previous = points[first_new - 1];
+            pb.move_to(previous[0], previous[1]);
+            for point in &points[first_new..] {
+                pb.line_to(point[0], point[1]);
+            }
+            let Some(path) = pb.finish() else {
+                return Vec::new();
+            };
+            *rendered = total;
+            (damages, path)
+        };
+
+        let Some(frame) = self.frame_pixmap.as_mut() else {
+            return Vec::new();
+        };
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(color[0], color[1], color[2], color[3]);
+        paint.anti_alias = true;
+        let stroke = SkiaStroke {
+            width,
+            line_cap: tiny_skia::LineCap::Round,
+            line_join: tiny_skia::LineJoin::Round,
+            ..Default::default()
+        };
+        frame.stroke_path(&path, &paint, &stroke, transform, None);
+        damages
+    }
+
+    fn erase_strokes_between(
+        &mut self,
+        from_screen: PhysicalPosition<f64>,
+        to_screen: PhysicalPosition<f64>,
+    ) -> bool {
+        let from = self.screen_to_world(from_screen);
+        let to = self.screen_to_world(to_screen);
+
+        // Same world-space radius as half the normal brush width.
+        let eraser_radius = self.current_stroke_width * 0.5;
+        let flatness_tolerance = ERASER_FLATNESS_PX / self.zoom;
+
+        // Query only spatial cells intersected by the swept eraser capsule.
+        self.ensure_spatial_index_current();
+        let query_bounds = [
+            from[0].min(to[0]) - eraser_radius,
+            from[1].min(to[1]) - eraser_radius,
+            from[0].max(to[0]) + eraser_radius,
+            from[1].max(to[1]) + eraser_radius,
+        ];
+        let query_tiles = tile_coords_for_bounds(query_bounds, SPATIAL_CELL_WORLD_SIZE, 0.0);
+
+        let mut candidate_ids = Vec::new();
+        for coord in query_tiles {
+            if let Some(ids) = self.tile_cache.stroke_ids_by_cell.get(&coord) {
+                candidate_ids.extend(ids.iter().copied());
+            }
+        }
+        candidate_ids.sort_unstable();
+        candidate_ids.dedup();
+
+        let mut removed_ids = HashSet::new();
+        let mut damages = Vec::new();
+        for stroke_id in candidate_ids {
+            let Some(&index) = self.stroke_id_to_index.get(&stroke_id) else {
+                continue;
+            };
+            let stroke = &self.strokes[index];
+            if stroke_touched_by_eraser(stroke, from, to, eraser_radius, flatness_tolerance) {
+                removed_ids.insert(stroke_id);
+                for stroke_damage in self.stroke_damage_rects(stroke) {
+                    add_damage_rect(&mut damages, stroke_damage);
+                }
+            }
+        }
+
+        if removed_ids.is_empty() {
+            return false;
+        }
+
+        // Compact the document and its parallel render/id arrays once, rather
+        // than repeatedly shifting their tails with Vec::remove().
+        let old_strokes = std::mem::take(&mut self.strokes);
+        let old_paths = std::mem::take(&mut self.stroke_cache.paths);
+        let old_ids = std::mem::take(&mut self.stroke_ids);
+        self.strokes = Vec::with_capacity(old_strokes.len() - removed_ids.len());
+        self.stroke_cache.paths = Vec::with_capacity(old_paths.len() - removed_ids.len());
+        self.stroke_ids = Vec::with_capacity(old_ids.len() - removed_ids.len());
+
+        for ((stroke, path), stroke_id) in old_strokes
+            .into_iter()
+            .zip(old_paths.into_iter())
+            .zip(old_ids.into_iter())
+        {
+            if removed_ids.contains(&stroke_id) {
+                self.unregister_stroke_from_tiles(stroke_id, stroke.bounds);
+            } else {
+                self.strokes.push(stroke);
+                self.stroke_cache.paths.push(path);
+                self.stroke_ids.push(stroke_id);
+            }
+        }
+
+        self.rebuild_stroke_id_to_index();
+        for damage in damages {
+            self.add_pending_tile_damage(damage);
+        }
+        true
+    }
+
+    fn update_brush_cursor(&self, event_loop: &dyn ActiveEventLoop) {
+        // Match the displayed brush diameter.
+        let diameter = (self.current_stroke_width * self.zoom).max(1.0);
+        let radius = diameter * 0.5;
+
+        // Leave a little transparent padding around the circle.
+        let padding = 2u16;
+
+        let mut size = (diameter.ceil() as u16).saturating_add(padding * 2).max(5);
+
+        // Use an odd-sized image for an exact centre hotspot.
+        if size % 2 == 0 {
+            size += 1;
+        }
+
+        // Keep the cursor image reasonably small.
+        size = size.min(127);
+
+        let center = (size / 2) as f32;
+
+        let color = if self.invert_contrast {
+            [
+                255 - self.current_stroke_color[0],
+                255 - self.current_stroke_color[1],
+                255 - self.current_stroke_color[2],
+                self.current_stroke_color[3],
+            ]
+        } else {
+            self.current_stroke_color
+        };
+
+        // RGBA buffer. CustomCursor expects non-premultiplied alpha.
+        let mut rgba = vec![0u8; size as usize * size as usize * 4];
+
+        for y in 0..size {
+            for x in 0..size {
+                let dx = x as f32 - center;
+                let dy = y as f32 - center;
+
+                let distance = (dx * dx + dy * dy).sqrt();
+
+                // Simple antialiased circular edge.
+                let coverage = (radius + 0.5 - distance).clamp(0.0, 1.0);
+
+                if coverage > 0.0 {
+                    let index = (y as usize * size as usize + x as usize) * 4;
+
+                    rgba[index] = color[0];
+                    rgba[index + 1] = color[1];
+                    rgba[index + 2] = color[2];
+
+                    rgba[index + 3] = (color[3] as f32 * coverage).round() as u8;
+                }
+            }
+        }
+
+        // Create the cursor image source.
+        let source = match CustomCursorSource::from_rgba(rgba, size, size, size / 2, size / 2) {
+            Ok(source) => source,
+            Err(err) => {
+                eprintln!("Failed to create brush cursor image: {err:?}");
+                return;
+            }
+        };
+
+        // Create the platform-specific cursor.
+        let cursor = match event_loop.create_custom_cursor(source) {
+            Ok(cursor) => cursor,
+            Err(err) => {
+                eprintln!("Failed to create platform cursor: {err:?}");
+                return;
+            }
+        };
+
+        // Install the cursor.
+        if let Some(window) = &self.window {
+            window.set_cursor(Cursor::Custom(cursor));
+        }
+    }
+
+    fn rebuild_frame_from_tiles(&mut self) {
+        let Some(pixmap) = self.frame_pixmap.as_ref() else {
+            return;
+        };
+        let full = PixelRect::full(pixmap.width(), pixmap.height());
+        self.composite_tiles_into_frame(full);
+
+        // The frame pixmap now represents the current camera position.
+    }
+
+    fn toggle_invert_contrast(&mut self, event_loop: &dyn ActiveEventLoop) {
+        self.invert_contrast = !self.invert_contrast;
+
+        // The canonical pixmap remains unchanged; inversion is applied while
+        // copying pixels into softbuffer. Mark the whole presentation dirty.
+        if let Some(frame) = &self.frame_pixmap {
+            self.pending_damage.clear();
+            self.pending_damage.push(PixelRect::full(frame.width(), frame.height()));
+        }
+        self.damage_history.clear();
+        self.update_brush_cursor(event_loop);
+        if let Some(win) = &self.window {
+            win.request_redraw();
+        }
+    }
+
+    fn render(&mut self) {
+        let preview_mode = match &self.interaction {
+            Interaction::Panning { .. } => 1,
+            Interaction::Zooming { .. } => 2,
+            _ => 0,
+        };
+        if preview_mode == 1 {
+            self.render_pan_frame();
+            return;
+        }
+        if preview_mode == 2 {
+            self.render_zoom_frame();
+            return;
+        }
+
+        let invert = self.invert_contrast;
+        let (Some(surface), Some(frame)) = (self.surface.as_mut(), self.frame_pixmap.as_ref())
+        else {
+            return;
+        };
+        let width = frame.width() as usize;
+        let height = frame.height() as usize;
+        let source = frame.data();
+
+        let Ok(mut buffer) = surface.buffer_mut() else {
+            return;
+        };
+        debug_assert_eq!(buffer.len(), width * height);
+
+        let age = buffer.age() as usize;
+        let full_rect = PixelRect::full(width as u32, height as u32);
+        let previous_frames_needed = age.saturating_sub(1);
+        let needs_full_copy = age == 0 || previous_frames_needed > self.damage_history.len();
+
+        let mut update_rects = if needs_full_copy {
+            vec![full_rect]
+        } else {
+            self.pending_damage.clone()
+        };
+
+        // A softbuffer buffer may be older than one frame. Reapply every
+        // intervening frame's damage, preserving disjoint regions.
+        if !needs_full_copy {
+            for previous_damage in self
+                .damage_history
+                .iter()
+                .rev()
+                .take(previous_frames_needed)
+            {
+                for rect in previous_damage.iter().copied() {
+                    add_damage_rect(&mut update_rects, rect);
+                }
+            }
+        }
+
+        if update_rects.is_empty() {
+            return;
+        }
+
+        // Convert only damaged RGBA pixels to softbuffer's 0x00RRGGBB format.
+        // The Pixmap is the sole canonical framebuffer; inversion is a
+        // presentation transform and never mutates cached or source pixels.
+        for rect in &update_rects {
+            for y in rect.y0 as usize..rect.y1 as usize {
+                let pixel_start = y * width + rect.x0 as usize;
+                let pixel_end = y * width + rect.x1 as usize;
+                let source_start = pixel_start * 4;
+                let source_end = pixel_end * 4;
+                let source_row = &source[source_start..source_end];
+                let destination_row = &mut buffer[pixel_start..pixel_end];
+
+                for (destination_pixel, rgba) in destination_row
+                    .iter_mut()
+                    .zip(source_row.chunks_exact(4))
+                {
+                    let pixel = ((rgba[0] as u32) << 16)
+                        | ((rgba[1] as u32) << 8)
+                        | rgba[2] as u32;
+                    *destination_pixel = if invert { pixel ^ RGB_INVERT_MASK } else { pixel };
+                }
+            }
+        }
+
+        let softbuffer_damage: Vec<Rect> = update_rects
+            .iter()
+            .copied()
+            .map(PixelRect::to_softbuffer_rect)
+            .collect();
+        let current_damage = self.pending_damage.clone();
+        let result = buffer.present_with_damage(&softbuffer_damage);
+        if result.is_ok() {
+            self.damage_history.push_back(current_damage);
+            if self.damage_history.len() > 8 {
+                self.damage_history.pop_front();
+            }
+            self.pending_damage.clear();
+        }
+    }
+
+}
+impl ApplicationHandler for MathCanvasApp {
+    fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
+        let attrs = WindowAttributes::default().with_title("Math Canvas (Tiny-Skia + Winit 0.31)");
+        let window: Rc<dyn Window> = Rc::from(event_loop.create_window(attrs).unwrap());
+
+        let context = Context::new(window.clone()).unwrap();
+        let mut surface = Surface::new(&context, window.clone()).unwrap();
+
+        // Initialise using the window's current dimensions
+        let size = window.surface_size();
+
+        if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
+            surface.resize(w, h).unwrap();
+
+            self.frame_pixmap = Pixmap::new(size.width, size.height);
+        }
+
+        self.window = Some(window);
+        self.surface = Some(surface);
+
+        // Initialise the native brush cursor.
+        self.update_brush_cursor(event_loop);
+
+        // Initialise the background cache.
+        self.rebuild_frame_from_tiles();
+
+        if let Some(win) = &self.window {
+            win.request_redraw();
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
+        let now = Instant::now();
+
+        // Coalesce drawing/erasing pointer events at the event-batch boundary.
+        if self.event_batch_redraw_pending {
+            self.event_batch_redraw_pending = false;
+            if let Some(win) = &self.window {
+                win.request_redraw();
+            }
+        }
+
+        // All zoom completion paths share finish_zoom_interaction().
+        let zoom_finished = matches!(
+            &self.interaction,
+            Interaction::Zooming { settle_at, .. } if now >= *settle_at
+        );
+        if zoom_finished {
+            self.finish_zoom_interaction(event_loop);
+            if let Some(win) = &self.window {
+                win.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+
+        // Pan/zoom preview frames remain rate-limited independently of pen input.
+        if self.redraw_pending {
+            let deadline = self.next_frame_deadline.unwrap_or(now);
+            if now >= deadline {
+                self.redraw_pending = false;
+                self.next_frame_deadline = Some(now + INTERACTIVE_FRAME_INTERVAL);
+                if let Some(win) = &self.window {
+                    win.request_redraw();
+                }
+            }
+        }
+
+        let frame_deadline = if self.redraw_pending {
+            Some(self.next_frame_deadline.unwrap_or(now))
+        } else {
+            None
+        };
+        let zoom_deadline = match &self.interaction {
+            Interaction::Zooming { settle_at, .. } => Some(*settle_at),
+            _ => None,
+        };
+
+        let next_deadline = match (frame_deadline, zoom_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+
+        if let Some(deadline) = next_deadline {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &dyn ActiveEventLoop,
+        _id: WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::SurfaceResized(size) => {
+                if let (Some(w), Some(h)) =
+                    (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+                {
+                    if let Some(surface) = self.surface.as_mut() {
+                        let _ = surface.resize(w, h);
+                    }
+                    // The viewport changed, so cancel any gesture-local state.
+                    self.interaction = Interaction::Idle;
+                    self.redraw_pending = false;
+                    self.event_batch_redraw_pending = false;
+                    self.next_frame_deadline = None;
+
+                    self.frame_pixmap = Pixmap::new(size.width, size.height);
+
+                    self.damage_history.clear();
+                    self.pending_damage.clear();
+                    self.pending_tile_damage.clear();
+
+                    self.cache_dirty = true;
+
+                    if let Some(win) = &self.window {
+                        win.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.inputs.shift = modifiers.state().shift_key();
+            }
+            WindowEvent::KeyboardInput {
+                event: KeyEvent {
+                    logical_key, state, ..
+                },
+                ..
+            } => {
+                let pressed = state == ElementState::Pressed;
+                match logical_key {
+                    Key::Character(ref c) if c == " " => self.inputs.space = pressed,
+                    Key::Character(ref c) if c.eq_ignore_ascii_case("i") => {
+                        if pressed && !self.inputs.invert {
+                            self.inputs.invert = true;
+                            self.toggle_invert_contrast(event_loop);
+                        } else if !pressed {
+                            self.inputs.invert = false;
+                        }
+                    }
+                    Key::Character(ref c) if pressed && c.eq_ignore_ascii_case("z") => {
+                        if let Some(removed_stroke) = self.strokes.pop() {
+                            let removed_path = self.stroke_cache.paths.pop();
+                            debug_assert!(removed_path.is_some());
+                            if let Some(stroke_id) = self.stroke_ids.pop() {
+                                self.unregister_stroke_from_tiles(stroke_id, removed_stroke.bounds);
+                            }
+                            self.rebuild_stroke_id_to_index();
+                            for damage in self.stroke_damage_rects(&removed_stroke) {
+                                self.add_pending_tile_damage(damage);
+                            }
+
+                            if let Some(win) = &self.window {
+                                win.request_redraw();
+                            }
+                        }
+                    }
+                    Key::Character(ref c) if c.eq_ignore_ascii_case("e") => {
+                        self.inputs.erase = pressed;
+                        if !pressed && matches!(&self.interaction, Interaction::Erasing) {
+                            self.interaction = Interaction::Idle;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            WindowEvent::PointerButton {
+                state,
+                position,
+                button,
+                primary: true,
+                ..
+            } => {
+                self.cursor_screen = position;
+                let is_primary_press = matches!(
+                    button,
+                    ButtonSource::Mouse(MouseButton::Left)
+                        | ButtonSource::Touch { .. }
+                        | ButtonSource::TabletTool { .. }
+                );
+                let is_middle_press = matches!(button, ButtonSource::Mouse(MouseButton::Middle));
+                match state {
+                    ElementState::Pressed => {
+                        let can_start_interaction = matches!(
+                            &self.interaction,
+                            Interaction::Idle | Interaction::Zooming { .. }
+                        );
+
+                        if is_primary_press
+                            && self.inputs.erase
+                            && !self.inputs.space
+                            && can_start_interaction
+                        {
+                            self.finish_zoom_interaction(event_loop);
+                            self.ensure_frame_current();
+                            self.interaction = Interaction::Erasing;
+                            if self.erase_strokes_between(position, position) {
+                                self.schedule_event_batch_redraw();
+                            }
+                        } else if is_primary_press
+                            && !self.inputs.space
+                            && !self.inputs.erase
+                            && can_start_interaction
+                        {
+                            self.finish_zoom_interaction(event_loop);
+                            self.ensure_frame_current();
+                            self.interaction = Interaction::Drawing {
+                                points: vec![self.screen_to_world(position)],
+                                rendered: 1,
+                            };
+                            if let Some(win) = &self.window {
+                                win.request_redraw();
+                            }
+                        } else if (is_middle_press || is_primary_press) && can_start_interaction {
+                            self.finish_zoom_interaction(event_loop);
+                            self.ensure_frame_current();
+                            self.interaction = Interaction::Panning {
+                                origin: self.pan,
+                                offset: [0, 0],
+                            };
+                        }
+                    }
+                    ElementState::Released
+                        if is_primary_press
+                            && matches!(&self.interaction, Interaction::Erasing) =>
+                    {
+                        self.interaction = Interaction::Idle;
+                    }
+                    ElementState::Released
+                        if is_primary_press
+                            && matches!(&self.interaction, Interaction::Drawing { .. }) =>
+                    {
+                        let Interaction::Drawing { points, .. } =
+                            std::mem::replace(&mut self.interaction, Interaction::Idle)
+                        else {
+                            unreachable!("drawing interaction changed during commit");
+                        };
+
+                        let epsilon =
+                            (STROKE_SAMPLE_DISTANCE_PX * STROKE_SIMPLIFICATION_RATIO) / self.zoom;
+                        let stroke = if self.inputs.shift {
+                            let Some(&start) = points.first() else {
+                                return;
+                            };
+                            let end = self.screen_to_world(position);
+                            VectorStroke::from_raw_points(
+                                &[start, end],
+                                self.current_stroke_width,
+                                self.current_stroke_color,
+                                epsilon,
+                            )
+                        } else {
+                            VectorStroke::from_raw_points(
+                                &points,
+                                self.current_stroke_width,
+                                self.current_stroke_color,
+                                epsilon,
+                            )
+                        };
+
+                        // Append the committed path to already-rendered tiles;
+                        // uncached raster tiles remain lazy.
+                        let mut commit_damage = Vec::new();
+                        let mut commit_succeeded = false;
+                        if let Some(stroke) = stroke {
+                            if let Some(path) = stroke.build_render_path() {
+                                commit_damage = self.stroke_commit_damage_rects(&stroke, &points);
+                                let stroke_id = self.next_stroke_id;
+                                self.next_stroke_id = self.next_stroke_id.wrapping_add(1).max(1);
+                                let bounds = stroke.bounds;
+
+                                self.strokes.push(stroke);
+                                self.stroke_cache.paths.push(path);
+                                self.stroke_ids.push(stroke_id);
+                                self.stroke_id_to_index
+                                    .insert(stroke_id, self.strokes.len() - 1);
+                                self.register_stroke_in_tiles(stroke_id, bounds);
+                                commit_succeeded = true;
+                            }
+                        }
+
+                        // Recompose the preview area from the final tile cache.
+                        if commit_succeeded {
+                            for damage in commit_damage {
+                                self.composite_tiles_into_frame(damage);
+                            }
+                        } else {
+                            self.rebuild_frame_from_tiles();
+                        }
+
+                        self.redraw_pending = false;
+                        self.event_batch_redraw_pending = false;
+                        if let Some(win) = &self.window {
+                            win.request_redraw();
+                        }
+                    }
+                    ElementState::Released
+                        if matches!(&self.interaction, Interaction::Panning { .. }) =>
+                    {
+                        self.interaction = Interaction::Idle;
+                        self.cache_dirty = true;
+                        self.redraw_pending = false;
+                        self.next_frame_deadline = None;
+                        if let Some(win) = &self.window {
+                            win.request_redraw();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            WindowEvent::PointerMoved {
+                position,
+                primary: true,
+                ..
+            } => {
+                let previous_position = self.cursor_screen;
+                let dx = (position.x - self.cursor_screen.x) as f32;
+                let dy = (position.y - self.cursor_screen.y) as f32;
+                self.cursor_screen = position;
+
+                let world_point = self.screen_to_world(position);
+                let zoom = self.zoom;
+                let mut needs_event_batch_redraw = false;
+                let mut needs_throttled_redraw = false;
+                let mut should_erase = false;
+
+                match &mut self.interaction {
+                    Interaction::Drawing { points, .. } => {
+                        let should_add_point = points.last().map_or(true, |last| {
+                            let sample_dx = (world_point[0] - last[0]) * zoom;
+                            let sample_dy = (world_point[1] - last[1]) * zoom;
+                            let distance_squared = sample_dx * sample_dx + sample_dy * sample_dy;
+                            distance_squared >= STROKE_SAMPLE_DISTANCE_PX.powi(2)
+                        });
+                        if should_add_point {
+                            points.push(world_point);
+                            needs_event_batch_redraw = true;
+                        }
+                    }
+                    Interaction::Panning { origin, offset } => {
+                        self.pan[0] += dx;
+                        self.pan[1] += dy;
+                        let new_offset = [
+                            (self.pan[0] - origin[0]).round() as i32,
+                            (self.pan[1] - origin[1]).round() as i32,
+                        ];
+                        if new_offset != *offset {
+                            *offset = new_offset;
+                            needs_throttled_redraw = true;
+                        }
+                    }
+                    Interaction::Erasing => should_erase = true,
+                    Interaction::Idle | Interaction::Zooming { .. } => {}
+                }
+
+                if should_erase {
+                    needs_event_batch_redraw =
+                        self.erase_strokes_between(previous_position, position);
+                }
+                if needs_event_batch_redraw {
+                    self.schedule_event_batch_redraw();
+                }
+                if needs_throttled_redraw {
+                    self.schedule_interactive_redraw(event_loop);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Don't change the camera during an active pen, eraser or pan gesture.
+                if matches!(
+                    &self.interaction,
+                    Interaction::Drawing { .. }
+                        | Interaction::Panning { .. }
+                        | Interaction::Erasing
+                ) {
+                    return;
+                }
+
+                // Keep the original canonical frame and camera transform for the
+                // whole wheel gesture; only the preview transform changes.
+                if matches!(&self.interaction, Interaction::Idle) {
+                    self.ensure_frame_current();
+                    self.interaction = Interaction::Zooming {
+                        origin_zoom: self.zoom,
+                        origin_pan: self.pan,
+                        settle_at: Instant::now() + ZOOM_SETTLE_DELAY,
+                    };
+                }
+
+                let scroll_y = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y * 24.0,
+                    MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
+                    _ => 0.0,
+                };
+                let factor = (1.0 + scroll_y * 0.002).clamp(0.5, 2.0);
+                let new_zoom = (self.zoom * factor).clamp(0.1, 20.0);
+
+                // Preserve the world position beneath the cursor.
+                let cx = self.cursor_screen.x as f32;
+                let cy = self.cursor_screen.y as f32;
+                self.pan[0] = cx - (cx - self.pan[0]) * (new_zoom / self.zoom);
+                self.pan[1] = cy - (cy - self.pan[1]) * (new_zoom / self.zoom);
+                self.zoom = new_zoom;
+
+                if let Interaction::Zooming { settle_at, .. } = &mut self.interaction {
+                    *settle_at = Instant::now() + ZOOM_SETTLE_DELAY;
+                }
+                self.schedule_interactive_redraw(event_loop);
+            }
+            WindowEvent::RedrawRequested => {
+                self.redraw_pending = false;
+                self.event_batch_redraw_pending = false;
+
+                // The canonical frame is recomposited only outside temporary
+                // pan/zoom previews. A drawing preview is replayed afterwards.
+                let camera_preview_active = matches!(
+                    &self.interaction,
+                    Interaction::Zooming { .. } | Interaction::Panning { .. }
+                );
+                if !camera_preview_active {
+                    if self.cache_dirty {
+                        self.rebuild_frame_from_tiles();
+                        self.cache_dirty = false;
+                        self.pending_tile_damage.clear();
+                        if let Interaction::Drawing { rendered, .. } = &mut self.interaction {
+                            *rendered = 1;
+                        }
+                    } else {
+                        self.refresh_pending_tile_damage();
+                    }
+                }
+
+                if matches!(&self.interaction, Interaction::Drawing { .. }) {
+                    for damage in self.draw_pending_preview_segments() {
+                        self.add_pending_damage(damage);
+                    }
+                }
+                self.render();
+            }
+            WindowEvent::Focused(false) => {
+                // Focus changes can suppress release events. Cancel the active
+                // gesture and rebuild to discard any temporary preview pixels.
+                self.inputs = HeldInputs::default();
+                if !matches!(&self.interaction, Interaction::Idle) {
+                    self.interaction = Interaction::Idle;
+                    self.cache_dirty = true;
+                    self.redraw_pending = false;
+                    self.event_batch_redraw_pending = false;
+                    self.next_frame_deadline = None;
+                    if let Some(win) = &self.window {
+                        win.request_redraw();
+                    }
+                }
+            }
+            // here is how we can handle autosave on close
+            // WindowEvent::CloseRequested => {
+            // }
+            _ => {}
+        }
+    }
+}
+fn main() {
+    let event_loop = EventLoop::new().unwrap();
+    event_loop.set_control_flow(ControlFlow::Wait);
+    let app = MathCanvasApp::default();
+    event_loop.run_app(app).unwrap();
+}
