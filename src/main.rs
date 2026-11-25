@@ -785,6 +785,8 @@ struct Document {
     stroke_id_to_index: HashMap<u64, usize>,
     next_stroke_id: u64,
     spatial_index: SpatialIndex,
+    query_cells: Vec<TileCoord>,
+    query_stroke_ids: Vec<u64>,
 }
 
 impl Default for Document {
@@ -796,6 +798,8 @@ impl Default for Document {
             stroke_id_to_index: HashMap::new(),
             next_stroke_id: 1,
             spatial_index: SpatialIndex::default(),
+            query_cells: Vec::new(),
+            query_stroke_ids: Vec::new(),
         }
     }
 }
@@ -861,28 +865,52 @@ impl Document {
         self.stroke_id_to_index.remove(&stroke_id);
     }
 
-    fn stroke(&self, stroke_id: u64) -> Option<&VectorStroke> {
-        let index = *self.stroke_id_to_index.get(&stroke_id)?;
-        self.strokes.get(index)
-    }
-
     fn stroke_render_data(&self, stroke_id: u64) -> Option<(&VectorStroke, &Path)> {
         let index = *self.stroke_id_to_index.get(&stroke_id)?;
         Some((self.strokes.get(index)?, self.stroke_cache.paths.get(index)?))
     }
 
-    fn stroke_ids_intersecting(&mut self, bounds: [f32; 4]) -> Vec<u64> {
+    // Visit matching strokes while the reusable query buffers remain owned by
+    // the document. Returning a slice into `self` would keep a mutable borrow
+    // alive while callers tried to look up each stroke immutably (E0502).
+    // The callback keeps the query allocation reusable without cloning IDs.
+    fn for_each_stroke_render_data_intersecting<F>(
+        &mut self,
+        bounds: [f32; 4],
+        mut visit: F,
+    ) where
+        F: FnMut(u64, &VectorStroke, &Path),
+    {
         self.ensure_spatial_index_current();
-        let cells = tile_coords_for_bounds(bounds, SPATIAL_CELL_WORLD_SIZE, 0.0);
-        let mut ids = Vec::new();
-        for cell in cells {
+        self.query_cells.clear();
+        self.query_cells
+            .extend(tile_coords_for_bounds(bounds, SPATIAL_CELL_WORLD_SIZE, 0.0));
+        self.query_stroke_ids.clear();
+
+        for cell in self.query_cells.iter().copied() {
             if let Some(cell_ids) = self.spatial_index.stroke_ids_by_cell.get(&cell) {
-                ids.extend(cell_ids.iter().copied());
+                self.query_stroke_ids.extend(cell_ids.iter().copied());
             }
         }
-        ids.sort_unstable();
-        ids.dedup();
-        ids
+        self.query_stroke_ids.sort_unstable();
+        self.query_stroke_ids.dedup();
+
+        // Copy the ID before borrowing the parallel document arrays. The
+        // callback receives references only for this iteration and cannot
+        // retain them beyond the call.
+        for index_in_query in 0..self.query_stroke_ids.len() {
+            let stroke_id = self.query_stroke_ids[index_in_query];
+            let Some(index) = self.stroke_id_to_index.get(&stroke_id).copied() else {
+                continue;
+            };
+            let (Some(stroke), Some(path)) = (
+                self.strokes.get(index),
+                self.stroke_cache.paths.get(index),
+            ) else {
+                continue;
+            };
+            visit(stroke_id, stroke, path);
+        }
     }
 
     fn pop_last_stroke(&mut self) -> Option<VectorStroke> {
@@ -1009,6 +1037,12 @@ struct TileRenderer {
     rendered_tiles: HashMap<RasterTileKey, CachedTile>,
     usage_clock: u64,
     pending_frame_damage: Vec<PixelRect>,
+    // Reused scratch storage keeps per-frame compositing and cache maintenance
+    // from allocating temporary vectors on every call.
+    x_samples: Vec<BilinearXSample>,
+    cached_levels: Vec<i32>,
+    cached_level_set: HashSet<i32>,
+    eviction_candidates: Vec<(u64, RasterTileKey)>,
     frame_dirty: bool,
 }
 
@@ -1036,24 +1070,31 @@ impl TileRenderer {
         ];
 
         // Query the zoom-independent spatial grid for strokes intersecting
-        // this raster tile, then restore document order using stable IDs.
-        let stroke_ids = document.stroke_ids_intersecting(tile_bounds);
-
-        if stroke_ids.is_empty() {
-            // Empty tiles are just the canvas background; do not allocate them.
-            return;
-        }
-
-        let mut pixmap = Pixmap::new(TILE_BITMAP_SIZE, TILE_BITMAP_SIZE)
-            .expect("failed to allocate canvas tile pixmap");
-        pixmap.fill(Color::from_rgba8(0, 0, 0, 255));
+        // this raster tile, visiting them in stable document order. The
+        // callback avoids returning a slice that would keep `document`
+        // mutably borrowed while looking up individual strokes.
+        // Allocate the raster tile lazily: empty spatial queries should not
+        // allocate a full pixmap merely to discover that nothing needs drawing.
+        let mut pixmap: Option<Pixmap> = None;
         let transform = tile_transform(coord, raster_scale);
 
-        for stroke_id in stroke_ids {
-            if let Some((stroke, path)) = document.stroke_render_data(stroke_id) {
-                stroke.draw_to_pixmap(path, &mut pixmap, transform);
-            }
-        }
+        document.for_each_stroke_render_data_intersecting(
+            tile_bounds,
+            |_, stroke, path| {
+                let tile_pixmap = pixmap.get_or_insert_with(|| {
+                    let mut tile = Pixmap::new(TILE_BITMAP_SIZE, TILE_BITMAP_SIZE)
+                        .expect("failed to allocate canvas tile pixmap");
+                    tile.fill(Color::from_rgba8(0, 0, 0, 255));
+                    tile
+                });
+                stroke.draw_to_pixmap(path, tile_pixmap, transform);
+            },
+        );
+
+        let Some(pixmap) = pixmap else {
+            // Empty tiles are just the canvas background; do not retain them.
+            return;
+        };
 
         self.rendered_tiles.insert(
             key,
@@ -1064,21 +1105,45 @@ impl TileRenderer {
         );
     }
     fn evict_old_tiles(&mut self, visible: &HashSet<RasterTileKey>) {
-        let mut cached_bytes = self.rendered_tiles.len() * TILE_BITMAP_BYTES;
+        let cached_bytes = self.rendered_tiles.len() * TILE_BITMAP_BYTES;
+        if cached_bytes <= MAX_TILE_CACHE_BYTES {
+            return;
+        }
 
-        while cached_bytes > MAX_TILE_CACHE_BYTES {
-            let oldest = self.rendered_tiles
+        // Gather the non-visible candidates once. The previous loop rescanned
+        // the whole cache to find the next oldest tile for every eviction,
+        // which became quadratic when a large batch was evicted.
+        self.eviction_candidates.clear();
+        self.eviction_candidates.extend(
+            self.rendered_tiles
                 .iter()
                 .filter(|(key, _)| !visible.contains(*key))
-                .min_by_key(|(_, tile)| tile.last_used)
-                .map(|(key, _)| *key);
-            let Some(key) = oldest else {
-                // Keep all tiles needed for the current viewport, even if the
-                // visible set alone temporarily exceeds the soft memory cap.
-                break;
-            };
-            if self.rendered_tiles.remove(&key).is_some() {
-                cached_bytes = cached_bytes.saturating_sub(TILE_BITMAP_BYTES);
+                .map(|(key, tile)| (tile.last_used, *key)),
+        );
+        let bytes_to_free = cached_bytes - MAX_TILE_CACHE_BYTES;
+        let required = bytes_to_free / TILE_BITMAP_BYTES
+            + if bytes_to_free % TILE_BITMAP_BYTES == 0 { 0 } else { 1 };
+        let evict_count = required.min(self.eviction_candidates.len());
+
+        // Partition around the oldest N candidates in linear expected time;
+        // a full sort would do extra work when only a few tiles need eviction.
+        if evict_count < self.eviction_candidates.len() {
+            self.eviction_candidates
+                .select_nth_unstable_by_key(evict_count, |(last_used, _)| *last_used);
+        }
+        for &(_, key) in self.eviction_candidates.iter().take(evict_count) {
+            self.rendered_tiles.remove(&key);
+        }
+        // As before, visible tiles are protected even if they alone exceed
+        // the soft cache limit.
+    }
+
+    fn collect_cached_levels(&mut self) {
+        self.cached_levels.clear();
+        self.cached_level_set.clear();
+        for key in self.rendered_tiles.keys() {
+            if self.cached_level_set.insert(key.level) {
+                self.cached_levels.push(key.level);
             }
         }
     }
@@ -1086,13 +1151,26 @@ impl TileRenderer {
     fn append_stroke_to_cached_tiles(&mut self, document: &Document, stroke_id: u64, bounds: [f32; 4]) {
         let Some((stroke, path)) = document.stroke_render_data(stroke_id) else { return; };
         let use_stamp = self.touch_clock();
-        for (key, tile) in self.rendered_tiles.iter_mut() {
-            let raster_scale = Self::raster_scale_for_level(key.level);
+
+        // Work level-by-level: calculate the stroke's affected coordinates
+        // once, then touch only matching entries through direct hash lookups.
+        self.collect_cached_levels();
+        for level in self.cached_levels.iter().copied() {
+            let raster_scale = Self::raster_scale_for_level(level);
             let world_size = TILE_SIZE_PX as f32 / raster_scale;
             let gutter_world = TILE_GUTTER_PX as f32 / raster_scale;
-            if tile_coords_for_bounds(bounds, world_size, gutter_world).contains(&key.coord) {
-                tile.last_used = use_stamp;
-                stroke.draw_to_pixmap(path, &mut tile.pixmap, tile_transform(key.coord, raster_scale));
+            let affected_coords = tile_coords_for_bounds(bounds, world_size, gutter_world);
+
+            for coord in affected_coords {
+                let key = RasterTileKey { level, coord };
+                if let Some(tile) = self.rendered_tiles.get_mut(&key) {
+                    tile.last_used = use_stamp;
+                    stroke.draw_to_pixmap(
+                        path,
+                        &mut tile.pixmap,
+                        tile_transform(coord, raster_scale),
+                    );
+                }
             }
         }
     }
@@ -1132,13 +1210,19 @@ impl TileRenderer {
     }
 
     fn invalidate_bounds(&mut self, bounds: [f32; 4]) {
-        let affected: Vec<RasterTileKey> = self.rendered_tiles.keys().copied().filter(|key| {
-            let raster_scale = Self::raster_scale_for_level(key.level);
+        // The affected coordinate list is identical for all cached tiles at a
+        // given level, so generate it once and remove entries by key directly.
+        self.collect_cached_levels();
+        for level in self.cached_levels.iter().copied() {
+            let raster_scale = Self::raster_scale_for_level(level);
             let world_size = TILE_SIZE_PX as f32 / raster_scale;
             let gutter_world = TILE_GUTTER_PX as f32 / raster_scale;
-            tile_coords_for_bounds(bounds, world_size, gutter_world).contains(&key.coord)
-        }).collect();
-        for key in affected { self.rendered_tiles.remove(&key); }
+            let affected_coords = tile_coords_for_bounds(bounds, world_size, gutter_world);
+
+            for coord in affected_coords {
+                self.rendered_tiles.remove(&RasterTileKey { level, coord });
+            }
+        }
     }
 
 
@@ -1166,8 +1250,6 @@ impl TileRenderer {
         let frame_size = presenter
             .frame_dimensions()
             .map(|(width, height)| (width as usize, height as usize));
-        let mut x_samples = Vec::new();
-
         if let (Some(destination), Some((width, _))) = (presenter.frame_mut(), frame_size) {
             // Clear the damaged area to the canonical (non-inverted) background.
             {
@@ -1196,7 +1278,7 @@ impl TileRenderer {
                         raster_scale,
                         zoom,
                         pan,
-                        &mut x_samples,
+                        &mut self.x_samples,
                     );
                 }
             }
@@ -1234,6 +1316,9 @@ struct Presenter {
     invert_contrast: bool,
     pending_damage: Vec<PixelRect>,
     damage_history: VecDeque<Vec<PixelRect>>,
+    update_rects: Vec<PixelRect>,
+    softbuffer_damage: Vec<Rect>,
+    recycled_damage: Vec<PixelRect>,
 }
 
 impl Presenter {
@@ -1253,6 +1338,9 @@ impl Presenter {
         self.frame_pixmap = Pixmap::new(width, height);
         self.pending_damage.clear();
         self.damage_history.clear();
+        self.update_rects.clear();
+        self.softbuffer_damage.clear();
+        self.recycled_damage.clear();
     }
 
     fn set_surface(&mut self, surface: Surface<Rc<dyn Window>, Rc<dyn Window>>) {
@@ -1561,15 +1649,15 @@ impl Presenter {
         let previous_frames_needed = age.saturating_sub(1);
         let needs_full_copy = age == 0 || previous_frames_needed > self.damage_history.len();
 
-        let mut update_rects = if needs_full_copy {
-            vec![full_rect]
+        self.update_rects.clear();
+        if needs_full_copy {
+            self.update_rects.push(full_rect);
         } else {
-            self.pending_damage.clone()
-        };
+            self.update_rects
+                .extend(self.pending_damage.iter().copied());
 
-        // A softbuffer buffer may be older than one frame. Reapply every
-        // intervening frame's damage, preserving disjoint regions.
-        if !needs_full_copy {
+            // A softbuffer buffer may be older than one frame. Reapply every
+            // intervening frame's damage, preserving disjoint regions.
             for previous_damage in self
                 .damage_history
                 .iter()
@@ -1577,19 +1665,19 @@ impl Presenter {
                 .take(previous_frames_needed)
             {
                 for rect in previous_damage.iter().copied() {
-                    add_damage_rect(&mut update_rects, rect);
+                    add_damage_rect(&mut self.update_rects, rect);
                 }
             }
         }
 
-        if update_rects.is_empty() {
+        if self.update_rects.is_empty() {
             return;
         }
 
         // Convert only damaged RGBA pixels to softbuffer's 0x00RRGGBB format.
         // The Pixmap is the sole canonical framebuffer; inversion is a
         // presentation transform and never mutates cached or source pixels.
-        for rect in &update_rects {
+        for rect in &self.update_rects {
             for y in rect.y0 as usize..rect.y1 as usize {
                 let pixel_start = y * width + rect.x0 as usize;
                 let pixel_end = y * width + rect.x1 as usize;
@@ -1610,19 +1698,23 @@ impl Presenter {
             }
         }
 
-        let softbuffer_damage: Vec<Rect> = update_rects
-            .iter()
-            .copied()
-            .map(PixelRect::to_softbuffer_rect)
-            .collect();
-        let current_damage = self.pending_damage.clone();
-        let result = buffer.present_with_damage(&softbuffer_damage);
+        self.softbuffer_damage.clear();
+        self.softbuffer_damage
+            .extend(self.update_rects.iter().copied().map(PixelRect::to_softbuffer_rect));
+        let result = buffer.present_with_damage(&self.softbuffer_damage);
         if result.is_ok() {
+            // Rotate damage vectors through a small pool. This avoids cloning
+            // the current rectangles and, after the history fills, reuses the
+            // oldest vector's allocation for the next frame.
+            let recycled = std::mem::take(&mut self.recycled_damage);
+            let current_damage = std::mem::replace(&mut self.pending_damage, recycled);
             self.damage_history.push_back(current_damage);
             if self.damage_history.len() > 8 {
-                self.damage_history.pop_front();
+                if let Some(mut oldest) = self.damage_history.pop_front() {
+                    oldest.clear();
+                    self.recycled_damage = oldest;
+                }
             }
-            self.pending_damage.clear();
         }
     }
 
@@ -1787,20 +1879,31 @@ impl MathCanvasApp {
             from[0].max(to[0]) + eraser_radius,
             from[1].max(to[1]) + eraser_radius,
         ];
-        let candidate_ids = self.document.stroke_ids_intersecting(query_bounds);
-
         let mut removed_ids = HashSet::new();
         let mut damages = Vec::new();
-        for stroke_id in candidate_ids {
-            let Some(stroke) = self.document.stroke(stroke_id) else {
-                continue;
-            };
-            if stroke_touched_by_eraser(stroke, from, to, eraser_radius, flatness_tolerance) {
-                removed_ids.insert(stroke_id);
-                for stroke_damage in self.presenter.stroke_damage_rects(stroke, &self.camera) {
-                    add_damage_rect(&mut damages, stroke_damage);
-                }
-            }
+        {
+            // Split the field borrows so the document can drive the query
+            // callback while damage calculation reads the presenter/camera.
+            let document = &mut self.document;
+            let presenter = &self.presenter;
+            let camera = &self.camera;
+            document.for_each_stroke_render_data_intersecting(
+                query_bounds,
+                |stroke_id, stroke, _path| {
+                    if stroke_touched_by_eraser(
+                        stroke,
+                        from,
+                        to,
+                        eraser_radius,
+                        flatness_tolerance,
+                    ) {
+                        removed_ids.insert(stroke_id);
+                        for stroke_damage in presenter.stroke_damage_rects(stroke, camera) {
+                            add_damage_rect(&mut damages, stroke_damage);
+                        }
+                    }
+                },
+            );
         }
 
         if removed_ids.is_empty() {
