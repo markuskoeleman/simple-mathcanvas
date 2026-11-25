@@ -271,6 +271,15 @@ fn tile_coords_for_bounds(bounds: [f32; 4], world_size: f32, gutter_world: f32) 
     coords
 }
 
+fn tile_transform(coord: TileCoord, raster_scale: f32) -> Transform {
+    // World -> tile-local pixels. The gutter allows antialiasing to extend
+    // across tile boundaries without creating visible seams.
+    Transform::from_scale(raster_scale, raster_scale).post_translate(
+        TILE_GUTTER_PX as f32 - coord.x as f32 * TILE_SIZE_PX as f32,
+        TILE_GUTTER_PX as f32 - coord.y as f32 * TILE_SIZE_PX as f32,
+    )
+}
+
 #[derive(Clone, Copy)]
 struct BilinearXSample {
     x0: usize,
@@ -288,6 +297,8 @@ fn composite_tile_region(
     zoom: f32,
     pan: [f32; 2],
     x_samples: &mut Vec<BilinearXSample>,
+    packed_destination: &mut [u32],
+    invert_contrast: bool,
 ) {
     let tile_left = coord.x as f32 * tile_world_size * zoom + pan[0];
     let tile_top = coord.y as f32 * tile_world_size * zoom + pan[1];
@@ -381,25 +392,49 @@ fn composite_tile_region(
 
         let destination_row = &mut destination_data[destination_start..destination_end];
 
+        // Corresponding row in the packed framebuffer.
+        let packed_start = y as usize * destination_width + x0 as usize;
+        let packed_end = packed_start + sample_count;
+
+        let packed_row = &mut packed_destination[packed_start..packed_end];
+
         // Bilinear interpolation.
-        for (dst, sample) in destination_row.chunks_exact_mut(4).zip(x_samples.iter()) {
+        for ((dst, packed_dst), sample) in destination_row
+            .chunks_exact_mut(4)
+            .zip(packed_row.iter_mut())
+            .zip(x_samples.iter())
+        {
             let fx = sample.fx;
             let inv_fx = 1.0 - fx;
 
             let sx0 = sample.x0;
             let sx1 = sample.x1;
 
-            // Interpolate RGB only. Tile alpha is always 255.
+            // Calculate final RGB values.
+            let mut rgb = [0u8; 3];
+
             for channel in 0..3 {
                 let top = row0[sx0 + channel] as f32 * inv_fx + row0[sx1 + channel] as f32 * fx;
 
                 let bottom = row1[sx0 + channel] as f32 * inv_fx + row1[sx1 + channel] as f32 * fx;
 
-                dst[channel] = (top * inv_fy + bottom * fy).round().clamp(0.0, 255.0) as u8;
+                rgb[channel] = (top * inv_fy + bottom * fy).round().clamp(0.0, 255.0) as u8;
             }
 
-            // Preserve fully opaque output.
+            // 1. Write RGBA framebuffer.
+            dst[0] = rgb[0];
+            dst[1] = rgb[1];
+            dst[2] = rgb[2];
             dst[3] = 255;
+
+            // 2. Write packed framebuffer.
+            let pixel = ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | (rgb[2] as u32);
+
+            *packed_dst = if invert_contrast {
+                pixel ^ RGB_INVERT_MASK
+            } else {
+                pixel
+            };
         }
     }
 }
@@ -841,7 +876,6 @@ impl MathCanvasApp {
             // Tile pixels are composited straight into the display pixmap. This
             // removes the need for a second viewport-sized committed pixmap.
             self.composite_tiles_into_frame(damage);
-            self.update_packed_region_from_frame(damage);
             if self.is_drawing {
                 // The damaged rectangle may have overwritten part of the live
                 // preview. Rebuild its incremental tail from the first point.
@@ -949,13 +983,33 @@ impl MathCanvasApp {
             TILE_GUTTER_PX as f32 / self.tile_cache.raster_scale,
         );
 
+        // Resolve the committed stroke once. Its ID/index and render path were
+        // added to the parallel document arrays immediately before this call.
+        let stroke_index = self.stroke_id_to_index.get(&stroke_id).copied();
+        let stroke = stroke_index.and_then(|index| self.strokes.get(index));
+        let path = stroke_index.and_then(|index| self.stroke_cache.paths.get(index));
+        let raster_scale = self.tile_cache.raster_scale;
+        self.tile_cache.usage_clock = self.tile_cache.usage_clock.wrapping_add(1);
+        let use_stamp = self.tile_cache.usage_clock;
+
         for coord in &coords {
             self.tile_cache
                 .stroke_ids_by_tile
                 .entry(*coord)
                 .or_default()
                 .push(stroke_id);
-            self.tile_cache.rendered_tiles.remove(coord);
+
+            // A newly committed stroke is always topmost. Append it directly
+            // to already-rendered tiles instead of discarding and rebuilding
+            // all previous strokes in those tiles. Keep other tiles lazy.
+            if let (Some(stroke), Some(path), Some(tile)) = (
+                stroke,
+                path,
+                self.tile_cache.rendered_tiles.get_mut(coord),
+            ) {
+                tile.last_used = use_stamp;
+                stroke.draw_to_pixmap(path, &mut tile.pixmap, tile_transform(*coord, raster_scale));
+            }
         }
         self.tile_cache.tiles_by_stroke.insert(stroke_id, coords);
     }
@@ -1004,12 +1058,7 @@ impl MathCanvasApp {
             .expect("failed to allocate canvas tile pixmap");
         pixmap.fill(Color::from_rgba8(0, 0, 0, 255));
 
-        // World -> tile-local pixels. The gutter allows antialiasing to extend
-        // across tile boundaries without creating visible seams.
-        let transform = Transform::from_scale(raster_scale, raster_scale).post_translate(
-            TILE_GUTTER_PX as f32 - coord.x as f32 * TILE_SIZE_PX as f32,
-            TILE_GUTTER_PX as f32 - coord.y as f32 * TILE_SIZE_PX as f32,
-        );
+        let transform = tile_transform(coord, raster_scale);
 
         for stroke_id in stroke_ids {
             let Some(&index) = self.stroke_id_to_index.get(&stroke_id) else {
@@ -1082,9 +1131,12 @@ impl MathCanvasApp {
     // Rebuild or composite only tiles intersecting a framebuffer rectangle.
     // Tiles are written directly into the display pixmap; empty tiles remain
     // implicit background and therefore consume no cached raster memory.
+
     fn composite_tiles_into_frame(&mut self, rect: PixelRect) {
         self.ensure_tile_index_current();
+
         let visible_coords = self.tile_coords_for_screen_rect(rect);
+
         for coord in &visible_coords {
             self.ensure_tile_rendered(*coord);
         }
@@ -1094,22 +1146,51 @@ impl MathCanvasApp {
         let zoom = self.zoom;
         let pan = self.pan;
 
+        let invert_contrast = self.invert_contrast;
+
+        let packed_background = if invert_contrast { RGB_INVERT_MASK } else { 0 };
+
+        // Ensure the packed framebuffer matches the viewport dimensions.
+        let frame_size = self
+            .frame_pixmap
+            .as_ref()
+            .map(|frame| (frame.width() as usize, frame.height() as usize));
+
+        if let Some((width, height)) = frame_size {
+            self.packed_frame.resize(width * height, packed_background);
+        }
+
+        // Reuse horizontal sampling coordinates across all tiles.
         let mut x_samples = Vec::new();
 
-        if let Some(destination) = self.frame_pixmap.as_mut() {
-            // Restore the region to the opaque canvas background first. This
-            // also clears old strokes and temporary preview pixels after edits.
-            let width = destination.width() as usize;
-            let data = destination.data_mut();
-            const BACKGROUND_RGBA: [u8; 4] = [0, 0, 0, 255];
-            for y in rect.y0 as usize..rect.y1 as usize {
-                let start = (y * width + rect.x0 as usize) * 4;
-                let end = (y * width + rect.x1 as usize) * 4;
-                for pixel in data[start..end].chunks_exact_mut(4) {
-                    pixel.copy_from_slice(&BACKGROUND_RGBA);
+        if let (Some(destination), Some((width, _))) = (self.frame_pixmap.as_mut(), frame_size)
+        {
+            let packed_frame = &mut self.packed_frame;
+
+            // Clear both framebuffer representations.
+            {
+                let destination_data = destination.data_mut();
+
+                const BACKGROUND_RGBA: [u8; 4] = [0, 0, 0, 255];
+
+                for y in rect.y0 as usize..rect.y1 as usize {
+                    let pixel_start = y * width + rect.x0 as usize;
+                    let pixel_end = y * width + rect.x1 as usize;
+
+                    let byte_start = pixel_start * 4;
+                    let byte_end = pixel_end * 4;
+
+                    // Clear RGBA framebuffer.
+                    for pixel in destination_data[byte_start..byte_end].chunks_exact_mut(4) {
+                        pixel.copy_from_slice(&BACKGROUND_RGBA);
+                    }
+
+                    // Clear packed framebuffer.
+                    packed_frame[pixel_start..pixel_end].fill(packed_background);
                 }
             }
 
+            // Composite visible tiles into both framebuffers simultaneously.
             for coord in &visible_coords {
                 if let Some(tile) = self.tile_cache.rendered_tiles.get(coord) {
                     composite_tile_region(
@@ -1122,47 +1203,30 @@ impl MathCanvasApp {
                         zoom,
                         pan,
                         &mut x_samples,
+                        packed_frame,
+                        invert_contrast,
                     );
                 }
             }
         }
 
+        // Both framebuffers have now been updated.
+        // Tell the presentation system which region changed.
+        if frame_size.is_some() {
+            self.add_pending_damage(rect);
+        }
+
+        // Calculate all tiles currently visible in the viewport.
         let viewport = self
             .frame_pixmap
             .as_ref()
             .map(|pixmap| PixelRect::full(pixmap.width(), pixmap.height()));
+
         let visible_set: HashSet<TileCoord> = viewport
             .map(|full| self.tile_coords_for_screen_rect(full).into_iter().collect())
             .unwrap_or_else(|| visible_coords.into_iter().collect());
+
         self.evict_old_tiles(&visible_set);
-    }
-
-    fn repack_frame_full(&mut self) {
-        let Some(frame) = self.frame_pixmap.as_ref() else {
-            return;
-        };
-
-        let width = frame.width() as usize;
-        let height = frame.height() as usize;
-        let data = frame.data();
-
-        self.packed_frame.resize(width * height, 0);
-
-        for (dst, src) in self.packed_frame.iter_mut().zip(data.chunks_exact(4)) {
-            let r = src[0] as u32;
-            let g = src[1] as u32;
-            let b = src[2] as u32;
-
-            let pixel = (r << 16) | (g << 8) | b;
-
-            *dst = if self.invert_contrast {
-                pixel ^ RGB_INVERT_MASK
-            } else {
-                pixel
-            };
-        }
-
-        self.pending_damage = Some(PixelRect::full(width as u32, height as u32));
     }
 
     fn add_pending_damage(&mut self, rect: PixelRect) {
@@ -1669,7 +1733,6 @@ impl MathCanvasApp {
         };
         let full = PixelRect::full(pixmap.width(), pixmap.height());
         self.composite_tiles_into_frame(full);
-        self.repack_frame_full();
 
         // The frame pixmap now represents the current camera position.
         self.pan_origin = self.pan;
@@ -2079,8 +2142,8 @@ impl ApplicationHandler for MathCanvasApp {
                             )
                         };
 
-                        // Commit the stroke to the retained vector document. Its affected
-                        // world-space tiles are invalidated and regenerated on demand.
+                        // Commit the stroke to the retained vector document. Existing
+                        // rasterized tiles are updated in-place; uncached tiles stay lazy.
                         let mut commit_damage = None;
                         let mut commit_succeeded = false;
 
@@ -2106,7 +2169,6 @@ impl ApplicationHandler for MathCanvasApp {
                         if commit_succeeded {
                             if let Some(damage) = commit_damage {
                                 self.composite_tiles_into_frame(damage);
-                                self.update_packed_region_from_frame(damage);
                             }
                         } else {
                             // Preserve the recovery behaviour if path creation fails.
