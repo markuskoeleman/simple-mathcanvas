@@ -6,13 +6,13 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tiny_skia::{Color, Paint, Path, PathBuilder, Pixmap, Stroke as SkiaStroke, Transform};
 use winit::application::ApplicationHandler;
-use winit::cursor::{Cursor, CustomCursorSource};
+use winit::cursor::{Cursor, CursorIcon, CustomCursorSource};
 use winit::dpi::PhysicalPosition;
 use winit::event::{
-    ButtonSource, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent,
+    ButtonSource, ElementState, KeyEvent, MouseButton, WindowEvent,
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::Key;
+use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 // Controls the density and smoothness of captured handwriting.
@@ -52,6 +52,11 @@ const DEFAULT_FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // ~60 F
 const PAGE_PAN_FRACTION: f32 = 0.85;
 const NUDGE_PAN_FRACTION: f32 = 0.10;
 
+// Overview is a read-only, fit-to-document view. Its framebuffer is rendered
+// directly from the vector document and is not stored in the writing tile cache.
+const OVERVIEW_MARGIN_FRACTION: f32 = 0.05;
+const MIN_OVERVIEW_ZOOM: f32 = 0.0001;
+
 // xor colors to invert them
 const RGB_INVERT_MASK: u32 = 0x00FF_FFFF;
 
@@ -73,12 +78,13 @@ fn convert_row(destination: &mut [u32], source_rgba: &[u8], xor: u32) {
     }
 }
 
-// How long scrolling must stop before committing the final vector rendering.
-const ZOOM_SETTLE_DELAY: Duration = Duration::from_millis(180);
+// The writing canvas uses a fixed 1:1 physical-pixel zoom. Overview is a
+// separate temporary fit-to-document view and never changes this working scale.
+const WRITING_ZOOM: f32 = 1.0;
 
-// World-aligned CPU raster tiles. Raster tiles are cached independently for
-// each quantised zoom level; the spatial index below uses a separate fixed
-// world-space grid and is therefore unaffected by zoom changes.
+// World-aligned CPU raster tiles for the fixed writing scale. The read-only
+// overview bypasses this cache and renders directly into the presenter frame.
+// The spatial index below uses a separate fixed world-space grid.
 const TILE_SIZE_PX: u32 = 512;
 const SPATIAL_CELL_WORLD_SIZE: f32 = 512.0;
 // Enough raster padding for the current 2.2-world-unit brush at maximum zoom
@@ -317,10 +323,36 @@ fn composite_tile_region(
     x_samples: &mut Vec<BilinearXSample>,
     vertical_samples: &mut Vec<u16>,
 ) {
-    let tile_left = coord.x as f32 * tile_world_size * zoom + pan[0];
-    let tile_top = coord.y as f32 * tile_world_size * zoom + pan[1];
-    let tile_right = tile_left + tile_world_size * zoom;
-    let tile_bottom = tile_top + tile_world_size * zoom;
+    // Writing mode has an exact 1.0x raster/display scale and integer pan.
+    // Compute screen origins in integer arithmetic so large tile coordinates
+    // cannot lose alignment through intermediate f32 multiplication.
+    let aligned_origin = if (zoom - raster_scale).abs() <= 1.0e-6
+        && pan[0].fract() == 0.0
+        && pan[1].fract() == 0.0
+    {
+        Some((
+            coord.x as i64 * TILE_SIZE_PX as i64 + pan[0].round() as i64,
+            coord.y as i64 * TILE_SIZE_PX as i64 + pan[1].round() as i64,
+        ))
+    } else {
+        None
+    };
+
+    let (tile_left, tile_top, tile_right, tile_bottom) =
+        if let Some((origin_x, origin_y)) = aligned_origin {
+            let left = origin_x as f32;
+            let top = origin_y as f32;
+            (
+                left,
+                top,
+                (origin_x + TILE_SIZE_PX as i64) as f32,
+                (origin_y + TILE_SIZE_PX as i64) as f32,
+            )
+        } else {
+            let left = coord.x as f32 * tile_world_size * zoom + pan[0];
+            let top = coord.y as f32 * tile_world_size * zoom + pan[1];
+            (left, top, left + tile_world_size * zoom, top + tile_world_size * zoom)
+        };
 
     // Calculate the destination pixel region covered by this tile.
     let x0 = (tile_left - 0.5).ceil().max(clip.x0 as f32).max(0.0) as u32;
@@ -349,20 +381,6 @@ fn composite_tile_region(
     // When the displayed scale exactly matches the raster scale and the tile
     // origin is pixel-aligned, every source sample is an exact pixel. Copy rows
     // directly instead of building interpolation samples or doing any blending.
-    let aligned_origin = if (zoom - raster_scale).abs() <= 1.0e-6 {
-        let rounded_left = tile_left.round();
-        let rounded_top = tile_top.round();
-        if (tile_left - rounded_left).abs() <= 1.0e-5
-            && (tile_top - rounded_top).abs() <= 1.0e-5
-        {
-            Some((rounded_left as i64, rounded_top as i64))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
     if let Some((origin_x, origin_y)) = aligned_origin {
         let copy_width = (x1 - x0) as usize;
         let copy_height = (y1 - y0) as usize;
@@ -942,11 +960,6 @@ enum InteractionMode {
         origin: [f32; 2],
         offset: [i32; 2],
     },
-    Zooming {
-        origin_zoom: f32,
-        origin_pan: [f32; 2],
-        settle_at: Instant,
-    },
 }
 
 // Keyboard modifiers are independent inputs, not interaction modes: Shift,
@@ -1015,6 +1028,25 @@ impl Default for Document {
 }
 
 impl Document {
+    // Return the union of all live stroke bounds. Stroke bounds already include
+    // brush padding, so the overview fit includes the full visible geometry.
+    fn content_bounds(&self) -> Option<[f32; 4]> {
+        let mut bounds: Option<[f32; 4]> = None;
+        for entry in self.entries.iter().flatten() {
+            let stroke_bounds = entry.stroke.bounds;
+            bounds = Some(match bounds {
+                None => stroke_bounds,
+                Some(current) => [
+                    current[0].min(stroke_bounds[0]),
+                    current[1].min(stroke_bounds[1]),
+                    current[2].max(stroke_bounds[2]),
+                    current[3].max(stroke_bounds[3]),
+                ],
+            });
+        }
+        bounds
+    }
+
     fn ensure_spatial_index_current(&mut self) {
         if self.spatial_index.built {
             return;
@@ -1148,8 +1180,29 @@ impl Document {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CameraSnapshot {
+    pan: [f32; 2],
+    zoom: f32,
+}
+
+#[derive(Clone, Copy, Default)]
+enum ViewMode {
+    #[default]
+    Writing,
+    Overview { writing_camera: CameraSnapshot },
+}
+
+impl ViewMode {
+    fn is_overview(&self) -> bool {
+        matches!(self, Self::Overview { .. })
+    }
+}
+
 struct Camera {
     pan: [f32; 2],
+    // Writing mode stays at WRITING_ZOOM; overview temporarily replaces this
+    // value and restores the exact saved camera when it exits.
     zoom: f32,
     cursor_screen: PhysicalPosition<f64>,
 }
@@ -1158,7 +1211,7 @@ impl Default for Camera {
     fn default() -> Self {
         Self {
             pan: [0.0, 0.0],
-            zoom: 1.0,
+            zoom: WRITING_ZOOM,
             cursor_screen: PhysicalPosition::new(0.0, 0.0),
         }
     }
@@ -1197,15 +1250,6 @@ impl Camera {
     fn pan_by(&mut self, dx: f32, dy: f32) {
         self.pan[0] += dx;
         self.pan[1] += dy;
-    }
-
-    fn zoom_at_cursor(&mut self, factor: f32) {
-        let new_zoom = (self.zoom * factor).clamp(0.1, 20.0);
-        let cx = self.cursor_screen.x as f32;
-        let cy = self.cursor_screen.y as f32;
-        self.pan[0] = cx - (cx - self.pan[0]) * (new_zoom / self.zoom);
-        self.pan[1] = cy - (cy - self.pan[1]) * (new_zoom / self.zoom);
-        self.zoom = new_zoom;
     }
 
     fn screen_to_world(&self, pos: PhysicalPosition<f64>) -> [f32; 2] {
@@ -1543,9 +1587,6 @@ struct Presenter {
     update_rects: Vec<PixelRect>,
     softbuffer_damage: Vec<Rect>,
     recycled_damage: Vec<PixelRect>,
-    // Horizontal source coordinates are identical for every row of a zoom
-    // preview, so retain this mapping between frames instead of reallocating.
-    zoom_xmap: Vec<i32>,
 }
 
 impl Presenter {
@@ -1829,104 +1870,9 @@ impl Presenter {
         presented
     }
 
-    fn render_zoom_frame(&mut self, camera: &Camera, interaction: &InteractionMode) -> bool {
-        let invert = self.invert_contrast;
-        let xor = if invert { RGB_INVERT_MASK } else { 0 };
-        let background = xor;
-        let zoom = camera.zoom;
-        let pan = camera.pan;
-        let (zoom_origin, pan_origin) = match interaction {
-            InteractionMode::Zooming { origin_zoom, origin_pan, .. } => (*origin_zoom, *origin_pan),
-            _ => return false,
-        };
-
-        let Some(frame) = self.frame_pixmap.as_ref() else {
-            return false;
-        };
-        let width = frame.width() as usize;
-        let height = frame.height() as usize;
-        let source = frame.data();
-
-        // The source X coordinate depends only on the destination column.
-        // Reuse the mapping allocation and build it once for the whole frame.
-        self.zoom_xmap.clear();
-        self.zoom_xmap.reserve(width);
-        let scale = zoom_origin / zoom;
-        for x in 0..width {
-            let source_x = ((x as f32 - pan[0]) * scale + pan_origin[0]).round() as i32;
-            self.zoom_xmap.push(source_x);
-        }
-        let x_lo = self.zoom_xmap.partition_point(|&source_x| source_x < 0);
-        let x_hi = self.zoom_xmap.partition_point(|&source_x| source_x < width as i32);
-
-        let Some(surface) = self.surface.as_mut() else {
-            return false;
-        };
-        let Ok(mut buffer) = surface.buffer_mut() else {
-            return false;
-        };
-        if buffer.len() != width * height {
-            return false;
-        }
-
-        for y in 0..height {
-            let source_y = ((y as f32 - pan[1]) * scale + pan_origin[1]).round() as i32;
-            let destination_row = &mut buffer[y * width..(y + 1) * width];
-            if source_y < 0 || source_y >= height as i32 {
-                destination_row.fill(background);
-                continue;
-            }
-
-            destination_row[..x_lo].fill(background);
-            destination_row[x_hi..].fill(background);
-            if x_lo < x_hi {
-                let source_row_start = source_y as usize * width * 4;
-                let source_row = &source[source_row_start..source_row_start + width * 4];
-                for x in x_lo..x_hi {
-                    let source_index = self.zoom_xmap[x] as usize * 4;
-                    destination_row[x] = pack_rgb(
-                        source_row[source_index],
-                        source_row[source_index + 1],
-                        source_row[source_index + 2],
-                        xor,
-                    );
-                }
-            }
-        }
-
-        let result = buffer.present();
-        let presented = result.is_ok();
-        if presented {
-            let full = PixelRect::full(width as u32, height as u32);
-
-            // A successful zoom preview replaces the entire displayed surface.
-            // Reuse an existing damage Vec for this full-frame history entry
-            // instead of allocating vec![full] on every preview frame.
-            let mut full_damage = std::mem::take(&mut self.recycled_damage);
-            if full_damage.capacity() == 0 {
-                full_damage = self.damage_history.pop_back().unwrap_or_default();
-            }
-            self.damage_history.clear();
-            full_damage.clear();
-            full_damage.push(full);
-            self.damage_history.push_back(full_damage);
-
-            self.pending_damage.clear();
-        }
-        presented
-    }
-
-    fn render(&mut self, camera: &Camera, interaction: &InteractionMode) -> bool {
-        let preview_mode = match interaction {
-            InteractionMode::Panning { .. } => 1,
-            InteractionMode::Zooming { .. } => 2,
-            _ => 0,
-        };
-        if preview_mode == 1 {
+    fn render(&mut self, interaction: &InteractionMode) -> bool {
+        if matches!(interaction, InteractionMode::Panning { .. }) {
             return self.render_pan_frame(interaction);
-        }
-        if preview_mode == 2 {
-            return self.render_zoom_frame(camera, interaction);
         }
 
         // No canonical-frame changes means there is nothing new to submit.
@@ -2055,6 +2001,8 @@ struct MathCanvasApp {
     window: Option<Rc<dyn Window>>,
     document: Document,
     camera: Camera,
+    view_mode: ViewMode,
+    overview_toggle_down: bool,
     interaction: Interaction,
     tile_renderer: TileRenderer,
     presenter: Presenter,
@@ -2073,6 +2021,8 @@ impl Default for MathCanvasApp {
             window: None,
             document: Document::default(),
             camera: Camera::default(),
+            view_mode: ViewMode::Writing,
+            overview_toggle_down: false,
             interaction: Interaction::default(),
             tile_renderer: TileRenderer::default(),
             presenter: Presenter::default(),
@@ -2129,6 +2079,10 @@ impl MathCanvasApp {
     // implicit background and therefore consume no cached raster memory.
 
     fn composite_tiles_into_frame(&mut self, rect: PixelRect) {
+        debug_assert!(!self.view_mode.is_overview());
+        debug_assert_eq!(self.camera.zoom, WRITING_ZOOM);
+        debug_assert_eq!(self.camera.pan[0].fract(), 0.0);
+        debug_assert_eq!(self.camera.pan[1].fract(), 0.0);
         self.tile_renderer.composite_into_frame(
             &mut self.document,
             &self.camera,
@@ -2138,29 +2092,12 @@ impl MathCanvasApp {
     }
 
 
-    fn finish_zoom_interaction(&mut self, event_loop: &dyn ActiveEventLoop) {
-        let previous = std::mem::replace(&mut self.interaction.mode, InteractionMode::Idle);
-        if !matches!(&previous, InteractionMode::Zooming { .. }) {
-            self.interaction.mode = previous;
-            return;
-        }
-
-        // This is the single zoom-finalisation path, used by the settle timer
-        // and by input that begins another interaction before the timer fires.
-        self.tile_renderer.mark_frame_dirty();
-        self.ensure_frame_current();
-        self.update_brush_cursor(event_loop);
-        self.redraw_wanted = false;
-    }
-
     // Pan the canvas in screen-space increments using H/J/K/L. A page jump
     // covers most of the viewport while retaining overlap with the previous
     // view; Shift turns it into a smaller viewport-relative nudge. These
     // changes use the normal dirty-frame and refresh-rate scheduling path.
-    fn pan_by_keyboard(&mut self, key: char, event_loop: &dyn ActiveEventLoop) {
-        if matches!(&self.interaction.mode, InteractionMode::Zooming { .. }) {
-            self.finish_zoom_interaction(event_loop);
-        } else if !matches!(&self.interaction.mode, InteractionMode::Idle) {
+    fn pan_by_keyboard(&mut self, key: char) {
+        if !matches!(&self.interaction.mode, InteractionMode::Idle) {
             // Do not interrupt an active pen, eraser, or pointer-pan gesture.
             return;
         }
@@ -2197,6 +2134,22 @@ impl MathCanvasApp {
     // one monitor interval after the last successful presentation.
     fn schedule_redraw(&mut self) {
         self.redraw_wanted = true;
+    }
+
+    // The pan preview displays an integer offset even while pointer coordinates
+    // arrive at fractional positions. Commit that exact displayed offset before
+    // any path returns the interaction to Idle (release, resize, or focus loss).
+    fn settle_pan_interaction(&mut self) {
+        let previous = std::mem::replace(&mut self.interaction.mode, InteractionMode::Idle);
+        match previous {
+            InteractionMode::Panning { origin, offset } => {
+                self.camera.pan = [
+                    origin[0] + offset[0] as f32,
+                    origin[1] + offset[1] as f32,
+                ];
+            }
+            other => self.interaction.mode = other,
+        }
     }
 
     // Avoid re-arming the platform timer when the effective control flow did
@@ -2413,6 +2366,121 @@ impl MathCanvasApp {
         // The frame pixmap now represents the current camera position.
     }
 
+    fn overview_camera_for_size(&self, width: u32, height: u32) -> (f32, [f32; 2]) {
+        let Some(bounds) = self.document.content_bounds() else {
+            // An empty document has nothing to fit. Keep a neutral camera and
+            // show the normal empty canvas background.
+            return (1.0, [0.0, 0.0]);
+        };
+
+        let available_width = (width as f32 * (1.0 - 2.0 * OVERVIEW_MARGIN_FRACTION)).max(1.0);
+        let available_height = (height as f32 * (1.0 - 2.0 * OVERVIEW_MARGIN_FRACTION)).max(1.0);
+        let document_width = (bounds[2] - bounds[0]).max(1.0e-3);
+        let document_height = (bounds[3] - bounds[1]).max(1.0e-3);
+
+        // Overview is strictly a zoom-out view: a small document is shown at
+        // the normal writing scale rather than magnified beyond 1.0x.
+        let zoom = (available_width / document_width)
+            .min(available_height / document_height)
+            .clamp(MIN_OVERVIEW_ZOOM, WRITING_ZOOM);
+
+        let document_center_x = (bounds[0] + bounds[2]) * 0.5;
+        let document_center_y = (bounds[1] + bounds[3]) * 0.5;
+        let pan = [
+            (width as f32 * 0.5 - document_center_x * zoom).round(),
+            (height as f32 * 0.5 - document_center_y * zoom).round(),
+        ];
+        (zoom, pan)
+    }
+
+    // Overview is deliberately a one-shot vector-to-frame render. It does not
+    // populate or mutate the writing tile cache; the writing frame is marked
+    // dirty on entry and rebuilt from its existing cache when overview exits.
+    fn render_overview_frame(&mut self) -> bool {
+        let Some((width, height)) = self.presenter.frame_dimensions() else {
+            return false;
+        };
+
+        let (zoom, pan) = self.overview_camera_for_size(width, height);
+        self.camera.zoom = zoom;
+        self.camera.pan = pan;
+        let transform = self.camera.transform();
+
+        let (document, presenter) = (&self.document, &mut self.presenter);
+        let Some(frame) = presenter.frame_mut() else {
+            return false;
+        };
+        frame.fill(Color::from_rgba8(0, 0, 0, 255));
+
+        // Entries are kept in insertion order, which is the document's z-order.
+        // Tombstones are skipped without allocating a temporary stroke list.
+        for entry in document.entries.iter().flatten() {
+            entry.stroke.draw_to_pixmap(&entry.path, frame, transform);
+        }
+        true
+    }
+
+    fn enter_overview(&mut self) {
+        // Do not discard an in-progress stroke, erase, or pointer-pan gesture.
+        if !matches!(&self.interaction.mode, InteractionMode::Idle) {
+            return;
+        }
+
+        let writing_camera = CameraSnapshot {
+            pan: self.camera.pan,
+            zoom: self.camera.zoom,
+        };
+        self.view_mode = ViewMode::Overview { writing_camera };
+        // Clear latched tool keys so a key released during read-only overview
+        // cannot leave a modifier/tool stuck on when writing resumes. Preserve
+        // Shift because ModifiersChanged continues to track it in overview.
+        self.interaction.inputs.space = false;
+        self.interaction.inputs.erase = false;
+        self.interaction.inputs.invert = false;
+        self.redraw_wanted = false;
+
+        // The shared canonical pixmap will now contain the overview image. Force
+        // a complete writing-frame rebuild when restoring the saved camera.
+        self.tile_renderer.mark_frame_dirty();
+        if self.render_overview_frame() {
+            self.presenter.mark_full_damage();
+        }
+
+        if let Some(window) = &self.window {
+            window.set_cursor(Cursor::Icon(CursorIcon::Default));
+            window.request_redraw();
+        }
+    }
+
+    fn exit_overview(&mut self, event_loop: &dyn ActiveEventLoop) {
+        let ViewMode::Overview { writing_camera } = self.view_mode else {
+            return;
+        };
+
+        self.view_mode = ViewMode::Writing;
+        self.camera.pan = writing_camera.pan;
+        self.camera.zoom = writing_camera.zoom;
+        self.redraw_wanted = false;
+
+        // Reconstruct the original writing view from its persistent tile cache.
+        self.tile_renderer.mark_frame_dirty();
+        self.ensure_frame_current();
+        self.presenter.mark_full_damage();
+        self.update_brush_cursor(event_loop);
+
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn toggle_overview(&mut self, event_loop: &dyn ActiveEventLoop) {
+        if self.view_mode.is_overview() {
+            self.exit_overview(event_loop);
+        } else {
+            self.enter_overview();
+        }
+    }
+
     fn toggle_invert_contrast(&mut self, event_loop: &dyn ActiveEventLoop) {
         self.presenter.toggle_invert();
 
@@ -2427,18 +2495,54 @@ impl MathCanvasApp {
 
 
     fn render(&mut self) -> bool {
-        self.presenter.render(&self.camera, &self.interaction.mode)
+        self.presenter.render(&self.interaction.mode)
+    }
+
+    fn record_successful_present(&mut self, started: Instant) {
+        self.last_present = Some(started);
+
+        // Lightweight debug instrumentation for checking the delivered
+        // presentation rate while drawing or navigating the canvas.
+        #[cfg(debug_assertions)]
+        {
+            match self.present_window_started {
+                Some(window_started) => {
+                    self.presents_in_window += 1;
+                    let elapsed = window_started.elapsed();
+                    if elapsed >= Duration::from_secs(1) {
+                        let presents_per_second =
+                            f64::from(self.presents_in_window) / elapsed.as_secs_f64();
+                        eprintln!("[math-canvas] presents: {presents_per_second:.1} FPS");
+                        self.presents_in_window = 0;
+                        self.present_window_started = Some(Instant::now());
+                    }
+                }
+                None => {
+                    self.presents_in_window = 1;
+                    self.present_window_started = Some(started);
+                }
+            }
+        }
     }
 
     fn redraw(&mut self) {
         let started = Instant::now();
         self.redraw_wanted = false;
 
-        // The canonical frame is recomposited only outside temporary
-        // pan/zoom previews. A drawing preview is replayed afterwards.
+        // Overview's framebuffer is already rendered directly from vectors.
+        // Never invoke writing-mode tile maintenance or preview drawing here.
+        if self.view_mode.is_overview() {
+            if self.render() {
+                self.record_successful_present(started);
+            }
+            return;
+        }
+
+        // The canonical frame is recomposited only outside the temporary
+        // pan preview. A drawing preview is replayed afterwards.
         let camera_preview_active = matches!(
             &self.interaction.mode,
-            InteractionMode::Zooming { .. } | InteractionMode::Panning { .. }
+            InteractionMode::Panning { .. }
         );
         if !camera_preview_active {
             if self.tile_renderer.frame_is_dirty() {
@@ -2458,31 +2562,7 @@ impl MathCanvasApp {
             }
         }
         if self.render() {
-            // Stamp the beginning of the successful frame, not its completion.
-            self.last_present = Some(started);
-
-            // Lightweight debug instrumentation for checking the delivered
-            // presentation rate while drawing or navigating the canvas.
-            #[cfg(debug_assertions)]
-            {
-                match self.present_window_started {
-                    Some(window_started) => {
-                        self.presents_in_window += 1;
-                        let elapsed = window_started.elapsed();
-                        if elapsed >= Duration::from_secs(1) {
-                            let presents_per_second =
-                                f64::from(self.presents_in_window) / elapsed.as_secs_f64();
-                            eprintln!("[math-canvas] presents: {presents_per_second:.1} FPS");
-                            self.presents_in_window = 0;
-                            self.present_window_started = Some(Instant::now());
-                        }
-                    }
-                    None => {
-                        self.presents_in_window = 1;
-                        self.present_window_started = Some(started);
-                    }
-                }
-            }
+            self.record_successful_present(started);
         }
     }
 }
@@ -2520,22 +2600,6 @@ impl ApplicationHandler for MathCanvasApp {
 
     fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
         let now = Instant::now();
-
-        // Finalize zoom before considering preview work so a single frame is
-        // rendered from the newly rebuilt canonical framebuffer.
-        let zoom_finished = matches!(
-            &self.interaction.mode,
-            InteractionMode::Zooming { settle_at, .. } if now >= *settle_at
-        );
-        if zoom_finished {
-            self.finish_zoom_interaction(event_loop);
-            self.redraw();
-            Self::set_control_flow_if_changed(event_loop, ControlFlow::Wait);
-            return;
-        }
-
-        // All interactive changes (pen, eraser, pan and zoom) use the same
-        // leading-edge cap. Draw directly here; do not queue RedrawRequested.
         if self.redraw_wanted {
             let due = self
                 .last_present
@@ -2548,45 +2612,19 @@ impl ApplicationHandler for MathCanvasApp {
         }
 
         // Recheck against a fresh clock before arming a timer. This also handles
-        // the edge case where the deadline passes during this callback: render
-        // now instead of setting WaitUntil to an already-expired Instant.
-        let mut now = Instant::now();
-        let frame_deadline = if self.redraw_wanted {
-            let due = self
-                .last_present
-                .map(|last| last + self.frame_interval)
-                .unwrap_or(now);
-            if due <= now {
-                self.redraw_wanted = false;
-                self.redraw();
-                now = Instant::now();
-                None
-            } else {
-                Some(due)
-            }
+        // the edge case where the deadline passes during rendering.
+        let now = Instant::now();
+        let next_deadline = if self.redraw_wanted {
+            Some(
+                self.last_present
+                    .map(|last| last + self.frame_interval)
+                    .unwrap_or(now),
+            )
         } else {
             None
         };
-
-        // Rendering can take long enough for a zoom gesture to settle. Use the
-        // fresh timestamp above and finalize immediately rather than arming a
-        // timer in the past.
-        let zoom_deadline = match &self.interaction.mode {
-            InteractionMode::Zooming { settle_at, .. } if *settle_at > now => Some(*settle_at),
-            InteractionMode::Zooming { .. } => {
-                self.finish_zoom_interaction(event_loop);
-                self.redraw();
-                Self::set_control_flow_if_changed(event_loop, ControlFlow::Wait);
-                return;
-            }
-            _ => None,
-        };
-
-        let next_deadline = [frame_deadline, zoom_deadline]
-            .into_iter()
-            .flatten()
-            .min();
         let control_flow = next_deadline
+            .filter(|deadline| *deadline > now)
             .map(ControlFlow::WaitUntil)
             .unwrap_or(ControlFlow::Wait);
         Self::set_control_flow_if_changed(event_loop, control_flow);
@@ -2606,14 +2644,23 @@ impl ApplicationHandler for MathCanvasApp {
                     (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
                 {
                     self.presenter.resize_surface(w, h);
-                    // The viewport changed, so cancel any gesture-local state.
+                    // The viewport changed, so commit the last displayed pan
+                    // offset before canceling any gesture-local state.
+                    self.settle_pan_interaction();
                     self.interaction.mode = InteractionMode::Idle;
                     self.redraw_wanted = false;
 
                     self.presenter.set_frame_size(size.width, size.height);
                     self.tile_renderer.clear_frame_damage();
 
-                    self.tile_renderer.mark_frame_dirty();
+                    if self.view_mode.is_overview() {
+                        // The saved writing camera remains untouched. Refit only
+                        // the temporary overview to the new physical viewport.
+                        self.render_overview_frame();
+                        self.presenter.mark_full_damage();
+                    } else {
+                        self.tile_renderer.mark_frame_dirty();
+                    }
 
                     if let Some(win) = &self.window {
                         win.request_redraw();
@@ -2633,6 +2680,34 @@ impl ApplicationHandler for MathCanvasApp {
                 ..
             } => {
                 let pressed = state == ElementState::Pressed;
+
+                // O is edge-triggered so keyboard auto-repeat cannot rapidly
+                // toggle between views. Its release is handled in either mode.
+                if matches!(&logical_key, Key::Character(c) if c.eq_ignore_ascii_case("o")) {
+                    if pressed {
+                        if !self.overview_toggle_down {
+                            self.overview_toggle_down = true;
+                            self.toggle_overview(event_loop);
+                        }
+                    } else {
+                        self.overview_toggle_down = false;
+                    }
+                    return;
+                }
+
+                if matches!(&logical_key, Key::Named(NamedKey::Escape)) {
+                    if pressed && self.view_mode.is_overview() {
+                        self.exit_overview(event_loop);
+                    }
+                    return;
+                }
+
+                // Overview is read-only: ignore every application shortcut other
+                // than O/Escape. Window lifecycle and redraw events still work.
+                if self.view_mode.is_overview() {
+                    return;
+                }
+
                 match logical_key {
                     Key::Character(ref c)
                         if pressed
@@ -2642,7 +2717,7 @@ impl ApplicationHandler for MathCanvasApp {
                                 || c.eq_ignore_ascii_case("l")) =>
                     {
                         if let Some(key) = c.chars().next().map(|ch| ch.to_ascii_lowercase()) {
-                            self.pan_by_keyboard(key, event_loop);
+                            self.pan_by_keyboard(key);
                         }
                     }
                     Key::Character(ref c)
@@ -2701,6 +2776,9 @@ impl ApplicationHandler for MathCanvasApp {
                 primary: true,
                 ..
             } => {
+                if self.view_mode.is_overview() {
+                    return;
+                }
                 self.camera.update_cursor(position);
                 let is_primary_press = matches!(
                     button,
@@ -2711,17 +2789,14 @@ impl ApplicationHandler for MathCanvasApp {
                 let is_middle_press = matches!(button, ButtonSource::Mouse(MouseButton::Middle));
                 match state {
                     ElementState::Pressed => {
-                        let can_start_interaction = matches!(
-                            &self.interaction.mode,
-                            InteractionMode::Idle | InteractionMode::Zooming { .. }
-                        );
+                        let can_start_interaction =
+                            matches!(&self.interaction.mode, InteractionMode::Idle);
 
                         if is_primary_press
                             && self.interaction.inputs.erase
                             && !self.interaction.inputs.space
                             && can_start_interaction
                         {
-                            self.finish_zoom_interaction(event_loop);
                             self.ensure_frame_current();
                             self.interaction.mode = InteractionMode::Erasing;
                             if self.erase_strokes_between(position, position) {
@@ -2732,7 +2807,6 @@ impl ApplicationHandler for MathCanvasApp {
                             && !self.interaction.inputs.erase
                             && can_start_interaction
                         {
-                            self.finish_zoom_interaction(event_loop);
                             self.ensure_frame_current();
                             self.interaction.mode = InteractionMode::Drawing {
                                 points: vec![self.screen_to_world(position)],
@@ -2740,7 +2814,6 @@ impl ApplicationHandler for MathCanvasApp {
                                 color: self.interaction.stroke_color,
                             };
                         } else if (is_middle_press || is_primary_press) && can_start_interaction {
-                            self.finish_zoom_interaction(event_loop);
                             self.ensure_frame_current();
                             self.interaction.mode = InteractionMode::Panning {
                                 origin: self.camera.pan,
@@ -2821,19 +2894,8 @@ impl ApplicationHandler for MathCanvasApp {
                     ElementState::Released
                         if matches!(&self.interaction.mode, InteractionMode::Panning { .. }) =>
                     {
-                        let InteractionMode::Panning { origin, offset } =
-                            std::mem::replace(&mut self.interaction.mode, InteractionMode::Idle)
-                        else {
-                            unreachable!("panning interaction changed during release");
-                        };
-
-                        // The live pan preview is shifted by this integer offset.
-                        // Commit the same camera position so rebuilding the canonical
-                        // frame cannot introduce a sub-pixel jump on release.
-                        self.camera.pan = [
-                            origin[0] + offset[0] as f32,
-                            origin[1] + offset[1] as f32,
-                        ];
+                        // Commit the exact integer offset shown by the pan preview.
+                        self.settle_pan_interaction();
                         self.tile_renderer.mark_frame_dirty();
                         self.redraw_wanted = false;
                         if let Some(win) = &self.window {
@@ -2848,6 +2910,12 @@ impl ApplicationHandler for MathCanvasApp {
                 primary: true,
                 ..
             } => {
+                if self.view_mode.is_overview() {
+                    // Track the pointer position without allowing any canvas
+                    // interaction while the read-only overview is displayed.
+                    self.camera.update_cursor(position);
+                    return;
+                }
                 let previous_position = self.camera.cursor_screen;
                 let dx = (position.x - self.camera.cursor_screen.x) as f32;
                 let dy = (position.y - self.camera.cursor_screen.y) as f32;
@@ -2883,7 +2951,7 @@ impl ApplicationHandler for MathCanvasApp {
                         }
                     }
                     InteractionMode::Erasing => should_erase = true,
-                    InteractionMode::Idle | InteractionMode::Zooming { .. } => {}
+                    InteractionMode::Idle => {}
                 }
 
                 if should_erase {
@@ -2893,48 +2961,17 @@ impl ApplicationHandler for MathCanvasApp {
                     self.schedule_redraw();
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } => {
-                // Don't change the camera during an active pen, eraser or pan gesture.
-                if matches!(
-                    &self.interaction.mode,
-                    InteractionMode::Drawing { .. }
-                        | InteractionMode::Panning { .. }
-                        | InteractionMode::Erasing
-                ) {
-                    return;
-                }
-
-                // Keep the original canonical frame and camera transform for the
-                // whole wheel gesture; only the preview transform changes.
-                if matches!(&self.interaction.mode, InteractionMode::Idle) {
-                    self.ensure_frame_current();
-                    self.interaction.mode = InteractionMode::Zooming {
-                        origin_zoom: self.camera.zoom,
-                        origin_pan: self.camera.pan,
-                        settle_at: Instant::now() + ZOOM_SETTLE_DELAY,
-                    };
-                }
-
-                let scroll_y = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y * 24.0,
-                    MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
-                    _ => 0.0,
-                };
-                let factor = (1.0 + scroll_y * 0.002).clamp(0.5, 2.0);
-                // Preserve the world position beneath the cursor.
-                self.camera.zoom_at_cursor(factor);
-
-                if let InteractionMode::Zooming { settle_at, .. } = &mut self.interaction.mode {
-                    *settle_at = Instant::now() + ZOOM_SETTLE_DELAY;
-                }
-                self.schedule_redraw();
-            }
+            // Writing view has a fixed 1.0x zoom. Use O for the temporary,
+            // read-only full-document overview instead of arbitrary wheel zoom.
+            WindowEvent::MouseWheel { .. } => {}
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::Focused(false) => {
-                // Focus changes can suppress release events. Cancel the active
-                // gesture and rebuild to discard any temporary preview pixels.
+                // Focus changes can suppress release events. Reset held-key
+                // bookkeeping; overview itself remains visible and read-only.
                 self.interaction.inputs = HeldInputs::default();
+                self.overview_toggle_down = false;
                 if !matches!(&self.interaction.mode, InteractionMode::Idle) {
+                    self.settle_pan_interaction();
                     self.interaction.mode = InteractionMode::Idle;
                     self.tile_renderer.mark_frame_dirty();
                     self.redraw_wanted = false;
