@@ -30,6 +30,20 @@ const ERASER_MAX_SUBDIVISION_DEPTH: u32 = 12;
 const DEFAULT_STROKE_WIDTH: f32 = 2.2;
 const DEFAULT_STROKE_COLOR: [u8; 4] = [255, 255, 255, 255];
 
+// Number keys 1-9 select these colours. Slot 1 intentionally preserves the
+// original white brush; replace slots 2-9 with the palette you prefer.
+const STROKE_PALETTE: &[[u8; 4]] = &[
+    DEFAULT_STROKE_COLOR,       // 1: default white
+    [255, 96, 96, 255],         // 2: placeholder
+    [255, 176, 64, 255],        // 3: placeholder
+    [232, 220, 80, 255],        // 4: placeholder
+    [88, 196, 120, 255],        // 5: placeholder
+    [64, 196, 196, 255],        // 6: placeholder
+    [88, 136, 248, 255],        // 7: placeholder
+    [168, 112, 232, 255],       // 8: placeholder
+    [232, 112, 184, 255],       // 9: placeholder
+];
+
 // Used when winit cannot report the current monitor's refresh rate.
 const DEFAULT_FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // ~60 FPS
 
@@ -919,6 +933,9 @@ enum InteractionMode {
     Drawing {
         points: Vec<[f32; 2]>,
         rendered: usize,
+        // Freeze the colour at pointer-down so changing the selected palette
+        // while drawing only affects the next stroke.
+        color: [u8; 4],
     },
     Erasing,
     Panning {
@@ -2219,16 +2236,32 @@ impl MathCanvasApp {
     }
 
     fn draw_pending_preview_segments(&mut self) -> Vec<PixelRect> {
-        let color = self.interaction.stroke_color;
         let width = self.interaction.stroke_width;
         let camera = &self.camera;
         let presenter = &mut self.presenter;
         match &mut self.interaction.mode {
-            InteractionMode::Drawing { points, rendered } => {
-                presenter.draw_preview_segments(points, rendered, camera, color, width)
-            }
+            InteractionMode::Drawing {
+                points,
+                rendered,
+                color,
+            } => presenter.draw_preview_segments(points, rendered, camera, *color, width),
             _ => Vec::new(),
         }
+    }
+
+    // Palette selection only changes the active tool state and cursor. It does
+    // not invalidate or redraw the canvas; committed and in-progress strokes
+    // retain the colour captured when they started.
+    fn select_stroke_color(&mut self, palette_index: usize, event_loop: &dyn ActiveEventLoop) {
+        let Some(&color) = STROKE_PALETTE.get(palette_index) else {
+            return;
+        };
+        if self.interaction.stroke_color == color {
+            return;
+        }
+
+        self.interaction.stroke_color = color;
+        self.update_brush_cursor(event_loop);
     }
 
     fn erase_strokes_between(
@@ -2612,6 +2645,25 @@ impl ApplicationHandler for MathCanvasApp {
                             self.pan_by_keyboard(key, event_loop);
                         }
                     }
+                    Key::Character(ref c)
+                        if pressed
+                            && (c == "1" || c == "2" || c == "3" || c == "4" || c == "5"
+                                || c == "6" || c == "7" || c == "8" || c == "9") =>
+                    {
+                        let palette_index = match c.as_str() {
+                            "1" => 0,
+                            "2" => 1,
+                            "3" => 2,
+                            "4" => 3,
+                            "5" => 4,
+                            "6" => 5,
+                            "7" => 6,
+                            "8" => 7,
+                            "9" => 8,
+                            _ => unreachable!("guard only accepts palette digits 1-9"),
+                        };
+                        self.select_stroke_color(palette_index, event_loop);
+                    }
                     Key::Character(ref c) if c == " " => self.interaction.inputs.space = pressed,
                     Key::Character(ref c) if c.eq_ignore_ascii_case("i") => {
                         if pressed && !self.interaction.inputs.invert {
@@ -2685,6 +2737,7 @@ impl ApplicationHandler for MathCanvasApp {
                             self.interaction.mode = InteractionMode::Drawing {
                                 points: vec![self.screen_to_world(position)],
                                 rendered: 1,
+                                color: self.interaction.stroke_color,
                             };
                         } else if (is_middle_press || is_primary_press) && can_start_interaction {
                             self.finish_zoom_interaction(event_loop);
@@ -2705,7 +2758,7 @@ impl ApplicationHandler for MathCanvasApp {
                         if is_primary_press
                             && matches!(&self.interaction.mode, InteractionMode::Drawing { .. }) =>
                     {
-                        let InteractionMode::Drawing { points, .. } =
+                        let InteractionMode::Drawing { points, color, .. } =
                             std::mem::replace(&mut self.interaction.mode, InteractionMode::Idle)
                         else {
                             unreachable!("drawing interaction changed during commit");
@@ -2721,14 +2774,14 @@ impl ApplicationHandler for MathCanvasApp {
                             VectorStroke::from_raw_points(
                                 &[start, end],
                                 self.interaction.stroke_width,
-                                self.interaction.stroke_color,
+                                color,
                                 epsilon,
                             )
                         } else {
                             VectorStroke::from_raw_points(
                                 &points,
                                 self.interaction.stroke_width,
-                                self.interaction.stroke_color,
+                                color,
                                 epsilon,
                             )
                         };
