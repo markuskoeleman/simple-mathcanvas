@@ -36,6 +36,24 @@ const DEFAULT_FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // ~60 F
 // xor colors to invert them
 const RGB_INVERT_MASK: u32 = 0x00FF_FFFF;
 
+// Pack one RGB pixel into softbuffer's 0x00RRGGBB format. Inversion is a
+// branch-free XOR selected once by the caller for the whole row/frame.
+#[inline]
+fn pack_rgb(red: u8, green: u8, blue: u8, xor: u32) -> u32 {
+    ((u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue)) ^ xor
+}
+
+#[inline]
+fn convert_row(destination: &mut [u32], source_rgba: &[u8], xor: u32) {
+    debug_assert_eq!(destination.len(), source_rgba.len() / 4);
+    for (destination_pixel, rgba) in destination
+        .iter_mut()
+        .zip(source_rgba.chunks_exact(4))
+    {
+        *destination_pixel = pack_rgb(rgba[0], rgba[1], rgba[2], xor);
+    }
+}
+
 // How long scrolling must stop before committing the final vector rendering.
 const ZOOM_SETTLE_DELAY: Duration = Duration::from_millis(180);
 
@@ -1471,6 +1489,9 @@ struct Presenter {
     update_rects: Vec<PixelRect>,
     softbuffer_damage: Vec<Rect>,
     recycled_damage: Vec<PixelRect>,
+    // Horizontal source coordinates are identical for every row of a zoom
+    // preview, so retain this mapping between frames instead of reallocating.
+    zoom_xmap: Vec<i32>,
 }
 
 impl Presenter {
@@ -1689,7 +1710,8 @@ impl Presenter {
 
     fn render_pan_frame(&mut self, interaction: &InteractionMode) -> bool {
         let invert = self.invert_contrast;
-        let background = if invert { RGB_INVERT_MASK } else { 0 };
+        let xor = if invert { RGB_INVERT_MASK } else { 0 };
+        let background = xor;
         let [dx, dy] = match interaction {
             InteractionMode::Panning { offset, .. } => *offset,
             _ => return false,
@@ -1714,27 +1736,33 @@ impl Presenter {
 
         let dx = dx as i64;
         let dy = dy as i64;
+        let w = width as i64;
+        // Horizontal validity is identical on every row. Calculate it once
+        // and convert only the contiguous source span that remains visible.
+        let x_start = dx.clamp(0, w) as usize;
+        let x_end = (w + dx).clamp(0, w) as usize;
+
         for y in 0..height {
-            let source_y = y as i64 - dy;
             let destination_row = &mut buffer[y * width..(y + 1) * width];
+            let source_y = y as i64 - dy;
             if source_y < 0 || source_y >= height as i64 {
                 destination_row.fill(background);
                 continue;
             }
 
-            let source_row_start = source_y as usize * width * 4;
-            for (x, destination_pixel) in destination_row.iter_mut().enumerate() {
-                let source_x = x as i64 - dx;
-                if source_x < 0 || source_x >= width as i64 {
-                    *destination_pixel = background;
-                    continue;
-                }
-
-                let source_index = source_row_start + source_x as usize * 4;
-                let pixel = ((source[source_index] as u32) << 16)
-                    | ((source[source_index + 1] as u32) << 8)
-                    | source[source_index + 2] as u32;
-                *destination_pixel = if invert { pixel ^ RGB_INVERT_MASK } else { pixel };
+            destination_row[..x_start].fill(background);
+            destination_row[x_end..].fill(background);
+            if x_start < x_end {
+                let source_row_start = source_y as usize * width * 4;
+                let source_row = &source[source_row_start..source_row_start + width * 4];
+                let source_x_start = (x_start as i64 - dx) as usize;
+                let source_start = source_x_start * 4;
+                let source_end = source_start + (x_end - x_start) * 4;
+                convert_row(
+                    &mut destination_row[x_start..x_end],
+                    &source_row[source_start..source_end],
+                    xor,
+                );
             }
         }
 
@@ -1746,9 +1774,11 @@ impl Presenter {
         }
         presented
     }
+
     fn render_zoom_frame(&mut self, camera: &Camera, interaction: &InteractionMode) -> bool {
         let invert = self.invert_contrast;
-        let background = if invert { RGB_INVERT_MASK } else { 0 };
+        let xor = if invert { RGB_INVERT_MASK } else { 0 };
+        let background = xor;
         let zoom = camera.zoom;
         let pan = camera.pan;
         let (zoom_origin, pan_origin) = match interaction {
@@ -1763,6 +1793,18 @@ impl Presenter {
         let height = frame.height() as usize;
         let source = frame.data();
 
+        // The source X coordinate depends only on the destination column.
+        // Reuse the mapping allocation and build it once for the whole frame.
+        self.zoom_xmap.clear();
+        self.zoom_xmap.reserve(width);
+        let scale = zoom_origin / zoom;
+        for x in 0..width {
+            let source_x = ((x as f32 - pan[0]) * scale + pan_origin[0]).round() as i32;
+            self.zoom_xmap.push(source_x);
+        }
+        let x_lo = self.zoom_xmap.partition_point(|&source_x| source_x < 0);
+        let x_hi = self.zoom_xmap.partition_point(|&source_x| source_x < width as i32);
+
         let Some(surface) = self.surface.as_mut() else {
             return false;
         };
@@ -1773,7 +1815,6 @@ impl Presenter {
             return false;
         }
 
-        let scale = zoom_origin / zoom;
         for y in 0..height {
             let source_y = ((y as f32 - pan[1]) * scale + pan_origin[1]).round() as i32;
             let destination_row = &mut buffer[y * width..(y + 1) * width];
@@ -1782,20 +1823,20 @@ impl Presenter {
                 continue;
             }
 
-            let source_row_start = source_y as usize * width * 4;
-            let mut source_x = (0.0 - pan[0]) * scale + pan_origin[0];
-            for destination_pixel in destination_row.iter_mut() {
-                let sx = source_x.round() as i32;
-                if sx < 0 || sx >= width as i32 {
-                    *destination_pixel = background;
-                } else {
-                    let source_index = source_row_start + sx as usize * 4;
-                    let pixel = ((source[source_index] as u32) << 16)
-                        | ((source[source_index + 1] as u32) << 8)
-                        | source[source_index + 2] as u32;
-                    *destination_pixel = if invert { pixel ^ RGB_INVERT_MASK } else { pixel };
+            destination_row[..x_lo].fill(background);
+            destination_row[x_hi..].fill(background);
+            if x_lo < x_hi {
+                let source_row_start = source_y as usize * width * 4;
+                let source_row = &source[source_row_start..source_row_start + width * 4];
+                for x in x_lo..x_hi {
+                    let source_index = self.zoom_xmap[x] as usize * 4;
+                    destination_row[x] = pack_rgb(
+                        source_row[source_index],
+                        source_row[source_index + 1],
+                        source_row[source_index + 2],
+                        xor,
+                    );
                 }
-                source_x += scale;
             }
         }
 
@@ -1831,6 +1872,7 @@ impl Presenter {
         }
 
         let invert = self.invert_contrast;
+        let xor = if invert { RGB_INVERT_MASK } else { 0 };
         let (Some(surface), Some(frame)) = (self.surface.as_mut(), self.frame_pixmap.as_ref())
         else {
             return false;
@@ -1886,15 +1928,7 @@ impl Presenter {
                 let source_row = &source[source_start..source_end];
                 let destination_row = &mut buffer[pixel_start..pixel_end];
 
-                for (destination_pixel, rgba) in destination_row
-                    .iter_mut()
-                    .zip(source_row.chunks_exact(4))
-                {
-                    let pixel = ((rgba[0] as u32) << 16)
-                        | ((rgba[1] as u32) << 8)
-                        | rgba[2] as u32;
-                    *destination_pixel = if invert { pixel ^ RGB_INVERT_MASK } else { pixel };
-                }
+                convert_row(destination_row, source_row, xor);
             }
         }
 
