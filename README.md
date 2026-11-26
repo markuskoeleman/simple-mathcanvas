@@ -10,4 +10,4 @@
 | `space` | Hold space to pan around |
 | `h j k l` | Use vim keybinds to jump by 85% of the screen |
 | `shift` + `h j k l` | Use vim bindinds to jump by 10% of the screen |
-| `o` | Toggle document overview |
+| `f` | Toggle document overview, clicking on a particular location while in overview mode will take you straight to that location |
