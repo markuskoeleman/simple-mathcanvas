@@ -468,39 +468,71 @@ fn rdp_simplify(pts: &[[f32; 2]], epsilon: f32) -> Vec<[f32; 2]> {
     if pts.len() < 3 {
         return pts.to_vec();
     }
-    let first = pts[0];
-    let last = pts[pts.len() - 1];
-    let mut max_dist = 0.0;
-    let mut index = 0;
 
-    let dx = last[0] - first[0];
-    let dy = last[1] - first[1];
-    let len_sq = dx * dx + dy * dy;
+    // Iterative Douglas-Peucker avoids recursive calls and the temporary Vec
+    // allocations made at every level of the recursive implementation.
+    // Keep the same distance calculation and strict comparisons as the
+    // original implementation so points near the tolerance boundary behave
+    // consistently.
+    let mut keep = vec![false; pts.len()];
+    keep[0] = true;
+    keep[pts.len() - 1] = true;
 
-    for (i, p) in pts.iter().enumerate().take(pts.len() - 1).skip(1) {
-        let dist = if len_sq < 1e-6 {
-            ((p[0] - first[0]).powi(2) + (p[1] - first[1]).powi(2)).sqrt()
-        } else {
-            let t = (((p[0] - first[0]) * dx + (p[1] - first[1]) * dy) / len_sq).clamp(0.0, 1.0);
-            let proj_x = first[0] + t * dx;
-            let proj_y = first[1] + t * dy;
-            ((p[0] - proj_x).powi(2) + (p[1] - proj_y).powi(2)).sqrt()
-        };
-        if dist > max_dist {
-            max_dist = dist;
-            index = i;
+    let mut stack = Vec::new();
+    stack.push((0usize, pts.len() - 1));
+
+    while let Some((start_index, end_index)) = stack.pop() {
+        if end_index <= start_index + 1 {
+            continue;
+        }
+
+        let first = pts[start_index];
+        let last = pts[end_index];
+        let dx = last[0] - first[0];
+        let dy = last[1] - first[1];
+        let len_sq = dx * dx + dy * dy;
+
+        let mut max_dist = 0.0f32;
+        let mut furthest_index = start_index;
+
+        for (index, point) in pts
+            .iter()
+            .enumerate()
+            .take(end_index)
+            .skip(start_index + 1)
+        {
+            let dist = if len_sq < 1e-6 {
+                ((point[0] - first[0]).powi(2) + (point[1] - first[1]).powi(2)).sqrt()
+            } else {
+                let t = (((point[0] - first[0]) * dx
+                    + (point[1] - first[1]) * dy)
+                    / len_sq)
+                    .clamp(0.0, 1.0);
+                let proj_x = first[0] + t * dx;
+                let proj_y = first[1] + t * dy;
+                ((point[0] - proj_x).powi(2) + (point[1] - proj_y).powi(2)).sqrt()
+            };
+
+            if dist > max_dist {
+                max_dist = dist;
+                furthest_index = index;
+            }
+        }
+
+        if max_dist > epsilon {
+            keep[furthest_index] = true;
+            // Push right first so the left interval is processed next, matching
+            // the original recursive traversal order (the retained set is the
+            // same either way).
+            stack.push((furthest_index, end_index));
+            stack.push((start_index, furthest_index));
         }
     }
 
-    if max_dist > epsilon {
-        let mut left = rdp_simplify(&pts[..=index], epsilon);
-        let right = rdp_simplify(&pts[index..], epsilon);
-        left.pop();
-        left.extend(right);
-        left
-    } else {
-        vec![first, last]
-    }
+    pts.iter()
+        .zip(keep.iter())
+        .filter_map(|(point, &retained)| retained.then_some(*point))
+        .collect()
 }
 
 fn point_to_segment_distance_squared(point: [f32; 2], start: [f32; 2], end: [f32; 2]) -> f32 {
@@ -1844,12 +1876,24 @@ impl Presenter {
         let presented = result.is_ok();
         if presented {
             let full = PixelRect::full(width as u32, height as u32);
+
+            // A successful zoom preview replaces the entire displayed surface.
+            // Reuse an existing damage Vec for this full-frame history entry
+            // instead of allocating vec![full] on every preview frame.
+            let mut full_damage = std::mem::take(&mut self.recycled_damage);
+            if full_damage.capacity() == 0 {
+                full_damage = self.damage_history.pop_back().unwrap_or_default();
+            }
             self.damage_history.clear();
-            self.damage_history.push_back(vec![full]);
+            full_damage.clear();
+            full_damage.push(full);
+            self.damage_history.push_back(full_damage);
+
             self.pending_damage.clear();
         }
         presented
     }
+
     fn render(&mut self, camera: &Camera, interaction: &InteractionMode) -> bool {
         let preview_mode = match interaction {
             InteractionMode::Panning { .. } => 1,
