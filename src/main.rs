@@ -33,6 +33,11 @@ const DEFAULT_STROKE_COLOR: [u8; 4] = [255, 255, 255, 255];
 // Used when winit cannot report the current monitor's refresh rate.
 const DEFAULT_FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // ~60 FPS
 
+// Keyboard camera navigation uses most of the viewport per page jump while
+// retaining overlap for orientation. Shift provides a smaller nudge.
+const PAGE_PAN_FRACTION: f32 = 0.85;
+const NUDGE_PAN_FRACTION: f32 = 0.10;
+
 // xor colors to invert them
 const RGB_INVERT_MASK: u32 = 0x00FF_FFFF;
 
@@ -2131,6 +2136,45 @@ impl MathCanvasApp {
         self.redraw_wanted = false;
     }
 
+    // Pan the canvas in screen-space increments using H/J/K/L. A page jump
+    // covers most of the viewport while retaining overlap with the previous
+    // view; Shift turns it into a smaller viewport-relative nudge. These
+    // changes use the normal dirty-frame and refresh-rate scheduling path.
+    fn pan_by_keyboard(&mut self, key: char, event_loop: &dyn ActiveEventLoop) {
+        if matches!(&self.interaction.mode, InteractionMode::Zooming { .. }) {
+            self.finish_zoom_interaction(event_loop);
+        } else if !matches!(&self.interaction.mode, InteractionMode::Idle) {
+            // Do not interrupt an active pen, eraser, or pointer-pan gesture.
+            return;
+        }
+
+        let Some((width, height)) = self.presenter.frame_dimensions() else {
+            return;
+        };
+        let fraction = if self.interaction.inputs.shift {
+            NUDGE_PAN_FRACTION
+        } else {
+            PAGE_PAN_FRACTION
+        };
+        let step_x = (width as f32 * fraction).round().max(1.0);
+        let step_y = (height as f32 * fraction).round().max(1.0);
+
+        // H/J/K/L move the viewport in the standard Vim directions.
+        // Camera pan translates canvas content in the opposite direction,
+        // so the transform delta is intentionally inverted here.
+        let (dx, dy) = match key {
+            'h' => (step_x, 0.0),   // viewport left; content moves right
+            'j' => (0.0, -step_y), // viewport down; content moves up
+            'k' => (0.0, step_y),  // viewport up; content moves down
+            'l' => (-step_x, 0.0), // viewport right; content moves left
+            _ => return,
+        };
+
+        self.camera.pan_by(dx, dy);
+        self.tile_renderer.mark_frame_dirty();
+        self.schedule_redraw();
+    }
+
     // Every interactive input path shares one leading-edge frame throttle.
     // The first requested frame after idle is immediate; later ones are due
     // one monitor interval after the last successful presentation.
@@ -2557,6 +2601,17 @@ impl ApplicationHandler for MathCanvasApp {
             } => {
                 let pressed = state == ElementState::Pressed;
                 match logical_key {
+                    Key::Character(ref c)
+                        if pressed
+                            && (c.eq_ignore_ascii_case("h")
+                                || c.eq_ignore_ascii_case("j")
+                                || c.eq_ignore_ascii_case("k")
+                                || c.eq_ignore_ascii_case("l")) =>
+                    {
+                        if let Some(key) = c.chars().next().map(|ch| ch.to_ascii_lowercase()) {
+                            self.pan_by_keyboard(key, event_loop);
+                        }
+                    }
                     Key::Character(ref c) if c == " " => self.interaction.inputs.space = pressed,
                     Key::Character(ref c) if c.eq_ignore_ascii_case("i") => {
                         if pressed && !self.interaction.inputs.invert {
