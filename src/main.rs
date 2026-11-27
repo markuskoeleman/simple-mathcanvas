@@ -1,6 +1,14 @@
+use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 use softbuffer::{Context, Rect, Surface};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Component, Path as FsPath, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::{self, JoinHandle};
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -11,7 +19,7 @@ use winit::dpi::PhysicalPosition;
 use winit::event::{
     ButtonSource, ElementState, KeyEvent, MouseButton, WindowEvent,
 };
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
@@ -46,6 +54,17 @@ const STROKE_PALETTE: &[[u8; 4]] = &[
 
 // Used when winit cannot report the current monitor's refresh rate.
 const DEFAULT_FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // ~60 FPS
+
+// Autosave is armed by the first persistent document edit, not polled every
+// minute. Further edits do not move the deadline, so continuous writing cannot
+// postpone an autosave indefinitely.
+const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(60);
+const DOCUMENT_STORAGE_DIR: &str = "mathcanvas";
+const DOCUMENT_EXTENSION: &str = "mathcanvas";
+const DOCUMENT_FILE_MAGIC: [u8; 8] = *b"MCANVAS\0";
+const DOCUMENT_FORMAT_VERSION: u16 = 2;
+const LEGACY_DOCUMENT_FORMAT_VERSION: u16 = 1;
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // Keyboard camera navigation uses most of the viewport per page jump while
 // retaining overlap for orientation. Shift provides a smaller nudge.
@@ -90,7 +109,7 @@ const TILE_SIZE_WORLD: f32 = TILE_SIZE_PX as f32;
 const SPATIAL_CELL_WORLD_SIZE: f32 = 512.0;
 // Bound the raster cache by memory rather than tile count. A 512px RGBA8 tile
 // occupies exactly 1 MiB, allowing 128 tiles within the 128 MiB soft limit.
-const MAX_TILE_CACHE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_TILE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const TILE_BITMAP_BYTES: usize = TILE_SIZE_PX as usize * TILE_SIZE_PX as usize * 4;
 
 // Keep disjoint damage regions separate, but bound history and per-frame work.
@@ -855,8 +874,8 @@ struct StrokeEntry {
 
 struct Document {
     // Insertion order is draw order. Tombstones preserve stable IDs and z-order.
-    // Slots are not reused or compacted in-memory; a future save path should
-    // serialize only live entries and assign compact IDs when loading.
+    // Slots are not reused or compacted in-memory. Serialization omits tombstones;
+    // a future loader can assign compact IDs while rebuilding runtime structures.
     entries: Vec<Option<StrokeEntry>>,
     last_live_id: Option<usize>,
     spatial_index: SpatialIndex,
@@ -1027,6 +1046,150 @@ impl Document {
         }
         removed
     }
+
+    // Serialize persistent vector geometry and the current Writing-mode viewport
+    // centre. Runtime paths, spatial-index structures, query scratch buffers, and
+    // tombstones are deliberately omitted. The viewport is captured only when
+    // an ordinary save is already happening; camera movement never triggers one.
+    fn serialize_for_save(
+        &self,
+        view_center: [f32; 2],
+    ) -> Result<Vec<u8>, postcard::Error> {
+        let snapshot = PersistedDocument {
+            magic: DOCUMENT_FILE_MAGIC,
+            version: DOCUMENT_FORMAT_VERSION,
+            view_center,
+            strokes: LiveStrokeSequence(self),
+        };
+        postcard::to_allocvec(&snapshot)
+    }
+
+    // Rebuild all runtime-only structures from persisted vector geometry.
+    // Version 1 documents did not contain a viewport centre, so they retain the
+    // original default camera position until their next save upgrades the file.
+    // Any invalid stroke rejects the complete document rather than silently
+    // dropping data and later autosaving an incomplete replacement.
+    fn deserialize_from_bytes(bytes: &[u8]) -> Result<(Self, Option<[f32; 2]>), String> {
+        // Read the fixed header separately so a future format version can be
+        // rejected before attempting to interpret its potentially different body.
+        let (header, body) = postcard::take_from_bytes::<PersistedDocumentHeader>(bytes)
+            .map_err(|error| format!("invalid document header: {error}"))?;
+
+        if header.magic != DOCUMENT_FILE_MAGIC {
+            return Err("file is not a MathCanvas document (invalid magic header)".to_owned());
+        }
+
+        let (strokes, view_center, trailing_bytes) = match header.version {
+            LEGACY_DOCUMENT_FORMAT_VERSION => {
+                let (strokes, trailing) = postcard::take_from_bytes::<Vec<VectorStroke>>(body)
+                    .map_err(|error| format!("invalid document data: {error}"))?;
+                (strokes, None, trailing)
+            }
+            DOCUMENT_FORMAT_VERSION => {
+                let (persisted, trailing) =
+                    postcard::take_from_bytes::<PersistedDocumentBodyV2>(body)
+                        .map_err(|error| format!("invalid document data: {error}"))?;
+                if !persisted.view_center.into_iter().all(|value| value.is_finite()) {
+                    return Err("document contains a non-finite viewport centre".to_owned());
+                }
+                (persisted.strokes, Some(persisted.view_center), trailing)
+            }
+            version => {
+                return Err(format!(
+                    "unsupported MathCanvas document version {} (this build supports {} and {})",
+                    version, LEGACY_DOCUMENT_FORMAT_VERSION, DOCUMENT_FORMAT_VERSION
+                ));
+            }
+        };
+
+        if !trailing_bytes.is_empty() {
+            return Err("document contains unexpected trailing data".to_owned());
+        }
+
+        let mut document = Self::default();
+        for (index, stroke) in strokes.into_iter().enumerate() {
+            validate_persisted_stroke(&stroke)
+                .map_err(|error| format!("invalid stroke {}: {error}", index + 1))?;
+            let path = stroke
+                .build_render_path()
+                .ok_or_else(|| format!("could not rebuild render path for stroke {}", index + 1))?;
+            document.append_stroke(stroke, path);
+        }
+
+        Ok((document, view_center))
+    }
+}
+
+// A borrowed Serde sequence avoids building a second Vec of stroke references
+// before serializing. Postcard allocates only the actual output byte buffer.
+struct LiveStrokeSequence<'a>(&'a Document);
+
+impl Serialize for LiveStrokeSequence<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let live_count = self.0.entries.iter().filter(|entry| entry.is_some()).count();
+        let mut sequence = serializer.serialize_seq(Some(live_count))?;
+        for entry in self.0.entries.iter().flatten() {
+            sequence.serialize_element(&entry.stroke)?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct PersistedDocument<'a> {
+    magic: [u8; 8],
+    version: u16,
+    view_center: [f32; 2],
+    strokes: LiveStrokeSequence<'a>,
+}
+
+#[derive(Deserialize)]
+struct PersistedDocumentBodyV2 {
+    view_center: [f32; 2],
+    strokes: Vec<VectorStroke>,
+}
+
+#[derive(Deserialize)]
+struct PersistedDocumentHeader {
+    magic: [u8; 8],
+    version: u16,
+}
+
+fn validate_persisted_stroke(stroke: &VectorStroke) -> Result<(), &'static str> {
+    let [min_x, min_y, max_x, max_y] = stroke.bounds;
+    if ![min_x, min_y, max_x, max_y, stroke.width, stroke.start[0], stroke.start[1]]
+        .into_iter()
+        .all(|value| value.is_finite())
+    {
+        return Err("contains non-finite coordinates or width");
+    }
+    if min_x > max_x || min_y > max_y {
+        return Err("has inverted bounds");
+    }
+    if stroke.width <= 0.0 {
+        return Err("has a non-positive stroke width");
+    }
+    if stroke.segments.is_empty() {
+        return Err("contains no curve segments");
+    }
+
+    for segment in &stroke.segments {
+        if ![
+            segment.ctrl1[0], segment.ctrl1[1],
+            segment.ctrl2[0], segment.ctrl2[1],
+            segment.end[0], segment.end[1],
+        ]
+        .into_iter()
+        .all(|value| value.is_finite())
+        {
+            return Err("contains non-finite curve coordinates");
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1068,6 +1231,15 @@ impl Default for Camera {
 }
 
 impl Camera {
+    // Reconstruct the integer writing-camera pan which places a persisted
+    // world-space point at the centre of a newly sized viewport.
+    fn pan_for_world_center(center: [f32; 2], width: u32, height: u32) -> [i32; 2] {
+        [
+            (width as f32 * 0.5 - center[0] * WRITING_ZOOM).round() as i32,
+            (height as f32 * 0.5 - center[1] * WRITING_ZOOM).round() as i32,
+        ]
+    }
+
     fn tile_coords_for_screen_rect(&self, rect: PixelRect) -> Vec<TileCoord> {
         if rect.x0 >= rect.x1 || rect.y0 >= rect.y1 {
             return Vec::new();
@@ -1781,6 +1953,153 @@ impl Presenter {
 
 }
 
+// --- Background autosave worker ---
+
+enum AutosaveCommand {
+    Write {
+        request_id: u64,
+        path: PathBuf,
+        bytes: Vec<u8>,
+    },
+    Shutdown,
+}
+
+struct AutosaveCompletion {
+    request_id: u64,
+    result: Result<(), String>,
+}
+
+struct AutosaveWorker {
+    command_sender: Sender<AutosaveCommand>,
+    completion_receiver: Receiver<AutosaveCompletion>,
+    join_handle: Option<JoinHandle<()>>,
+}
+
+impl AutosaveWorker {
+    fn spawn(proxy: EventLoopProxy) -> std::io::Result<Self> {
+        let (command_sender, command_receiver) = mpsc::channel();
+        let (completion_sender, completion_receiver) = mpsc::channel();
+
+        let join_handle = thread::Builder::new()
+            .name("mathcanvas-autosave".to_owned())
+            .spawn(move || {
+                while let Ok(command) = command_receiver.recv() {
+                    match command {
+                        AutosaveCommand::Write { request_id, path, bytes } => {
+                            let result = write_file_atomically(&path, &bytes)
+                                .map_err(|error| error.to_string());
+                            let _ = completion_sender.send(AutosaveCompletion {
+                                request_id,
+                                result,
+                            });
+                            // Winit 0.31 coalesces proxy wake-ups. The app drains
+                            // all queued completion messages in proxy_wake_up().
+                            proxy.wake_up();
+                        }
+                        AutosaveCommand::Shutdown => break,
+                    }
+                }
+            })?;
+
+        Ok(Self {
+            command_sender,
+            completion_receiver,
+            join_handle: Some(join_handle),
+        })
+    }
+
+    fn shutdown_and_join(&mut self) -> Result<(), String> {
+        let send_result = self
+            .command_sender
+            .send(AutosaveCommand::Shutdown)
+            .map_err(|_| "autosave worker stopped before shutdown".to_owned());
+        let join_result = if let Some(join_handle) = self.join_handle.take() {
+            join_handle
+                .join()
+                .map_err(|_| "autosave worker thread panicked".to_owned())
+        } else {
+            Ok(())
+        };
+
+        send_result.and(join_result)
+    }
+}
+
+impl Drop for AutosaveWorker {
+    fn drop(&mut self) {
+        // Also join on unexpected event-loop exit so the worker never outlives
+        // the application object. Normal window close has already joined it.
+        if let Some(join_handle) = self.join_handle.take() {
+            let _ = self.command_sender.send(AutosaveCommand::Shutdown);
+            let _ = join_handle.join();
+        }
+    }
+}
+
+fn write_file_atomically(destination: &FsPath, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| FsPath::new("."));
+    let file_name = destination.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "document path has no filename")
+    })?;
+
+    // Create a unique temporary file beside the destination. Keeping it in the
+    // same directory ensures the final rename stays on the same filesystem.
+    let (temporary_path, mut temporary_file) = loop {
+        let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut temporary_name = OsString::from(file_name);
+        temporary_name.push(format!(".{}.{}.tmp", std::process::id(), counter));
+        let candidate = parent.join(temporary_name);
+
+        match OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(file) => break (candidate, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+
+    let write_result = temporary_file
+        .write_all(bytes)
+        .and_then(|()| temporary_file.sync_all());
+    drop(temporary_file);
+
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+
+    if let Err(error) = fs::rename(&temporary_path, destination) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+#[derive(Default)]
+struct AutosaveState {
+    path: Option<PathBuf>,
+    dirty: bool,
+    deadline: Option<Instant>,
+    save_in_progress: bool,
+    in_flight_id: Option<u64>,
+    next_request_id: u64,
+}
+
+impl AutosaveState {
+    fn mark_dirty(&mut self) {
+        if self.dirty {
+            return;
+        }
+        self.dirty = true;
+        if self.path.is_some() {
+            self.deadline = Some(Instant::now() + AUTOSAVE_INTERVAL);
+        }
+    }
+}
+
 // --- Application & Two-Stage Rendering State ---
 
 struct MathCanvasApp {
@@ -1798,6 +2117,9 @@ struct MathCanvasApp {
     redraw_wanted: bool,
     frame_interval: Duration,
     last_present: Option<Instant>,
+    autosave: AutosaveState,
+    autosave_worker: Option<AutosaveWorker>,
+    initial_view_center: Option<[f32; 2]>,
     #[cfg(debug_assertions)]
     presents_in_window: u32,
     #[cfg(debug_assertions)]
@@ -1819,6 +2141,9 @@ impl Default for MathCanvasApp {
             redraw_wanted: false,
             frame_interval: DEFAULT_FRAME_INTERVAL,
             last_present: None,
+            autosave: AutosaveState::default(),
+            autosave_worker: None,
+            initial_view_center: None,
             #[cfg(debug_assertions)]
             presents_in_window: 0,
             #[cfg(debug_assertions)]
@@ -1828,6 +2153,216 @@ impl Default for MathCanvasApp {
 }
 
 impl MathCanvasApp {
+    fn new(
+        document: Document,
+        path: Option<PathBuf>,
+        initial_view_center: Option<[f32; 2]>,
+        proxy: EventLoopProxy,
+    ) -> std::io::Result<Self> {
+        let mut app = Self::default();
+        app.document = document;
+        app.autosave.path = path;
+        app.initial_view_center = initial_view_center;
+        if app.autosave.path.is_some() {
+            app.autosave_worker = Some(AutosaveWorker::spawn(proxy)?);
+        }
+        Ok(app)
+    }
+
+    // Return the centre of the Writing-mode camera in document/world
+    // coordinates. Overview has its own temporary camera, so use its saved
+    // writing-camera pan instead. During a pointer-pan gesture include the
+    // currently displayed preview offset, not just the pre-gesture camera.
+    fn writing_view_center_world(&self) -> Option<[f32; 2]> {
+        let (width, height) = self.presenter.frame_dimensions()?;
+        let pan = match (&self.view_mode, &self.interaction.mode) {
+            (ViewMode::Overview { writing_camera }, _) => writing_camera.pan,
+            (ViewMode::Writing, InteractionMode::Panning { origin, offset, .. }) => [
+                origin[0].saturating_add(offset[0]),
+                origin[1].saturating_add(offset[1]),
+            ],
+            (ViewMode::Writing, _) => self.camera.pan,
+        };
+
+        Some([
+            (width as f32 * 0.5 - pan[0] as f32) / WRITING_ZOOM,
+            (height as f32 * 0.5 - pan[1] as f32) / WRITING_ZOOM,
+        ])
+    }
+
+    // Serialize a consistent byte snapshot on the main thread. The viewport
+    // centre is piggybacked on this save and does not create its own save event.
+    fn serialize_snapshot_for_save(&self) -> Result<Vec<u8>, String> {
+        let view_center = self
+            .writing_view_center_world()
+            .ok_or_else(|| "cannot determine viewport centre before the window is initialized".to_owned())?;
+        self.document
+            .serialize_for_save(view_center)
+            .map_err(|error| error.to_string())
+    }
+
+    fn restore_initial_view_center_if_ready(&mut self) {
+        let Some((width, height)) = self.presenter.frame_dimensions() else {
+            return;
+        };
+        let Some(center) = self.initial_view_center.take() else {
+            return;
+        };
+        self.camera.pan = Camera::pan_for_world_center(center, width, height);
+    }
+
+    fn mark_document_dirty(&mut self) {
+        self.autosave.mark_dirty();
+    }
+
+    fn start_autosave_if_due(&mut self, now: Instant) {
+        if !self.autosave.dirty || self.autosave.save_in_progress {
+            return;
+        }
+        let Some(deadline) = self.autosave.deadline else {
+            return;
+        };
+        if now < deadline {
+            return;
+        }
+        let Some(path) = self.autosave.path.clone() else {
+            return;
+        };
+        let Some(worker) = self.autosave_worker.as_ref() else {
+            return;
+        };
+
+        // Serialization intentionally remains on the main thread. Only the
+        // resulting independent byte buffer crosses the worker boundary.
+        let bytes = match self.serialize_snapshot_for_save() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("[math-canvas] document serialization failed: {error}");
+                self.autosave.deadline = Some(now + AUTOSAVE_INTERVAL);
+                return;
+            }
+        };
+
+        let request_id = self.autosave.next_request_id;
+        match worker.command_sender.send(AutosaveCommand::Write {
+            request_id,
+            path,
+            bytes,
+        }) {
+            Ok(()) => {
+                self.autosave.next_request_id = request_id.wrapping_add(1);
+                self.autosave.dirty = false;
+                self.autosave.deadline = None;
+                self.autosave.save_in_progress = true;
+                self.autosave.in_flight_id = Some(request_id);
+            }
+            Err(error) => {
+                eprintln!("[math-canvas] could not queue autosave: {error}");
+                self.autosave.deadline = Some(now + AUTOSAVE_INTERVAL);
+            }
+        }
+    }
+
+    fn process_autosave_completions(&mut self) {
+        let completions: Vec<AutosaveCompletion> = self
+            .autosave_worker
+            .as_ref()
+            .map(|worker| worker.completion_receiver.try_iter().collect())
+            .unwrap_or_default();
+
+        for completion in completions {
+            if self.autosave.in_flight_id != Some(completion.request_id) {
+                continue;
+            }
+            self.autosave.save_in_progress = false;
+            self.autosave.in_flight_id = None;
+
+            match completion.result {
+                Ok(()) => eprintln!("[math-canvas] autosaved"),
+                Err(error) => {
+                    eprintln!("[math-canvas] autosave failed: {error}");
+                    // If no newer edit arrived during the failed save, restore
+                    // the dirty state and retry after another interval. Otherwise
+                    // retain the deadline already started by that newer edit.
+                    if !self.autosave.dirty {
+                        self.autosave.dirty = true;
+                        self.autosave.deadline = Some(Instant::now() + AUTOSAVE_INTERVAL);
+                    } else if self.autosave.deadline.is_none() {
+                        self.autosave.deadline = Some(Instant::now() + AUTOSAVE_INTERVAL);
+                    }
+                }
+            }
+        }
+
+        self.start_autosave_if_due(Instant::now());
+    }
+
+    fn save_and_stop_worker(&mut self) {
+        // Always queue one final snapshot for an associated document, even when
+        // no strokes are dirty. This captures view-only navigation since the
+        // previous autosave without making camera movement trigger a save.
+        // FIFO worker ordering ensures this is the last snapshot renamed into place.
+        let mut awaited_request = self.autosave.in_flight_id;
+        let mut final_snapshot_queued = false;
+
+        if let (Some(path), Some(worker)) = (
+            self.autosave.path.clone(),
+            self.autosave_worker.as_ref(),
+        ) {
+            match self.serialize_snapshot_for_save() {
+                Ok(bytes) => {
+                    let request_id = self.autosave.next_request_id;
+                    match worker.command_sender.send(AutosaveCommand::Write {
+                        request_id,
+                        path,
+                        bytes,
+                    }) {
+                        Ok(()) => {
+                            awaited_request = Some(request_id);
+                            final_snapshot_queued = true;
+                            self.autosave.next_request_id = request_id.wrapping_add(1);
+                            self.autosave.dirty = false;
+                            self.autosave.deadline = None;
+                            self.autosave.save_in_progress = true;
+                            self.autosave.in_flight_id = Some(request_id);
+                        }
+                        Err(error) => {
+                            eprintln!("[math-canvas] could not queue final save: {error}");
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[math-canvas] final document serialization failed: {error}");
+                }
+            }
+        }
+
+        if self.autosave.dirty && self.autosave.path.is_some() && !final_snapshot_queued {
+            eprintln!("[math-canvas] closing with document changes that could not be queued for saving");
+        }
+
+        if let Some(worker) = self.autosave_worker.as_mut() {
+            if let Err(error) = worker.shutdown_and_join() {
+                eprintln!("[math-canvas] autosave worker shutdown failed: {error}");
+            }
+
+            let mut awaited_result = None;
+            for completion in worker.completion_receiver.try_iter() {
+                if Some(completion.request_id) == awaited_request {
+                    awaited_result = Some(completion.result);
+                }
+            }
+
+            if awaited_request.is_some() {
+                match awaited_result {
+                    Some(Ok(())) => eprintln!("[math-canvas] final autosave completed"),
+                    Some(Err(error)) => eprintln!("[math-canvas] final autosave failed: {error}"),
+                    None => eprintln!("[math-canvas] autosave worker exited without confirming the final save"),
+                }
+            }
+        }
+    }
+
     fn register_stroke_in_tiles(&mut self, stroke_id: usize, bounds: [f32; 4]) {
         // Document already indexed the stroke atomically when it was appended.
         self.tile_renderer
@@ -2053,6 +2588,7 @@ impl MathCanvasApp {
         for stroke in self.document.remove_strokes(&removed_ids) {
             self.tile_renderer.invalidate_bounds(stroke.bounds);
         }
+        self.mark_document_dirty();
         for damage in damages {
             self.add_pending_tile_damage(damage);
         }
@@ -2409,6 +2945,10 @@ impl ApplicationHandler for MathCanvasApp {
             self.presenter.set_frame_size(size.width, size.height);
         }
 
+        // The persisted centre is independent of window dimensions. Convert it
+        // to the current physical-pixel pan only after the framebuffer is sized.
+        self.restore_initial_view_center_if_ready();
+
         self.window = Some(window);
         self.update_frame_interval();
         self.presenter.set_surface(surface);
@@ -2437,10 +2977,15 @@ impl ApplicationHandler for MathCanvasApp {
             }
         }
 
-        // Recheck against a fresh clock before arming a timer. This also handles
-        // the edge case where the deadline passes during rendering.
+        // Autosave is deadline-driven. The dirty flag is only set at document
+        // mutation sites; no document scan or revision comparison is performed.
+        self.start_autosave_if_due(Instant::now());
+
+        // Arm one timer for whichever operation is due first: a throttled frame
+        // or an autosave deadline. A running save wakes this loop through Winit's
+        // EventLoopProxy when its worker completion arrives.
         let now = Instant::now();
-        let next_deadline = if self.redraw_wanted {
+        let redraw_deadline = if self.redraw_wanted {
             Some(
                 self.last_present
                     .map(|last| last + self.frame_interval)
@@ -2449,11 +2994,26 @@ impl ApplicationHandler for MathCanvasApp {
         } else {
             None
         };
+        let autosave_deadline = if self.autosave.dirty && !self.autosave.save_in_progress {
+            self.autosave.deadline
+        } else {
+            None
+        };
+        let next_deadline = match (redraw_deadline, autosave_deadline) {
+            (Some(redraw), Some(save)) => Some(redraw.min(save)),
+            (Some(redraw), None) => Some(redraw),
+            (None, Some(save)) => Some(save),
+            (None, None) => None,
+        };
         let control_flow = next_deadline
             .filter(|deadline| *deadline > now)
             .map(ControlFlow::WaitUntil)
             .unwrap_or(ControlFlow::Wait);
         Self::set_control_flow_if_changed(event_loop, control_flow);
+    }
+
+    fn proxy_wake_up(&mut self, _event_loop: &dyn ActiveEventLoop) {
+        self.process_autosave_completions();
     }
 
     fn window_event(
@@ -2463,7 +3023,10 @@ impl ApplicationHandler for MathCanvasApp {
         event: WindowEvent,
     ) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.save_and_stop_worker();
+                event_loop.exit();
+            }
             WindowEvent::SurfaceResized(size) => {
                 self.update_frame_interval();
                 if let (Some(w), Some(h)) =
@@ -2477,6 +3040,7 @@ impl ApplicationHandler for MathCanvasApp {
                     self.redraw_wanted = false;
 
                     self.presenter.set_frame_size(size.width, size.height);
+                    self.restore_initial_view_center_if_ready();
                     self.tile_renderer.clear_frame_damage();
 
                     if self.view_mode.is_overview() {
@@ -2576,6 +3140,7 @@ impl ApplicationHandler for MathCanvasApp {
                     }
                     Key::Character(ref c) if pressed && c.eq_ignore_ascii_case("z") => {
                         if let Some(removed_stroke) = self.document.pop_last_stroke() {
+                            self.mark_document_dirty();
                             self.tile_renderer.invalidate_bounds(removed_stroke.bounds);
                             for damage in self.presenter.stroke_damage_rects(&removed_stroke, &self.camera) {
                                 self.add_pending_tile_damage(damage);
@@ -2715,6 +3280,7 @@ impl ApplicationHandler for MathCanvasApp {
                                     self.interaction.stroke_width,
                                 );
                                 let (stroke_id, bounds) = self.document.append_stroke(stroke, path);
+                                self.mark_document_dirty();
                                 self.register_stroke_in_tiles(stroke_id, bounds);
                                 commit_succeeded = true;
                             }
@@ -2812,7 +3378,7 @@ impl ApplicationHandler for MathCanvasApp {
                     self.schedule_redraw();
                 }
             }
-            // Writing view has a fixed 1.0x zoom. Use O for the temporary,
+            // Writing view has a fixed 1.0x zoom. F toggles the temporary,
             // read-only full-document overview instead of arbitrary wheel zoom.
             WindowEvent::MouseWheel { .. } => {}
             WindowEvent::RedrawRequested => self.redraw(),
@@ -2832,15 +3398,150 @@ impl ApplicationHandler for MathCanvasApp {
                     }
                 }
             }
-            // here is how we can handle autosave on close
-            // WindowEvent::CloseRequested => {
-            // }
             _ => {}
         }
     }
 }
+fn resolve_document_path(argument: &OsStr) -> Result<(PathBuf, bool), String> {
+    let relative_path = FsPath::new(argument);
+    if relative_path.as_os_str().is_empty() || relative_path.is_absolute() {
+        return Err("document path must be a non-empty relative path".to_owned());
+    }
+    if relative_path
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err("document path cannot contain '.', '..', or root components".to_owned());
+    }
+
+    let mut relative_path = relative_path.to_path_buf();
+    match relative_path.extension() {
+        None => {
+            relative_path.set_extension(DOCUMENT_EXTENSION);
+        }
+        Some(extension) if extension == OsStr::new(DOCUMENT_EXTENSION) => {}
+        Some(_) => {
+            return Err(format!(
+                "document extension must be .{DOCUMENT_EXTENSION} (or omitted)"
+            ));
+        }
+    }
+
+    let file_name = relative_path
+        .file_name()
+        .ok_or_else(|| "document path must include a filename".to_owned())?;
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| "HOME is not set; cannot determine the document storage directory".to_owned())?;
+    let storage_root = PathBuf::from(home).join(DOCUMENT_STORAGE_DIR);
+    fs::create_dir_all(&storage_root)
+        .map_err(|error| format!("could not create {}: {error}", storage_root.display()))?;
+    let canonical_root = fs::canonicalize(&storage_root)
+        .map_err(|error| format!("could not resolve {}: {error}", storage_root.display()))?;
+
+    let relative_parent = relative_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| FsPath::new(""));
+    let requested_parent = canonical_root.join(relative_parent);
+    fs::create_dir_all(&requested_parent)
+        .map_err(|error| format!("could not create document directory: {error}"))?;
+    let canonical_parent = fs::canonicalize(&requested_parent)
+        .map_err(|error| format!("could not resolve document directory: {error}"))?;
+
+    // Reject directory symlinks which would otherwise let a relative name
+    // escape the dedicated storage root.
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err("document path resolves outside ~/mathcanvas".to_owned());
+    }
+
+    let destination = canonical_parent.join(file_name);
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "{} is a symbolic link; document symlinks are not supported",
+            destination.display()
+        )),
+        Ok(metadata) if !metadata.is_file() => Err(format!(
+            "{} exists but is not a regular file",
+            destination.display()
+        )),
+        Ok(_) => Ok((destination, true)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((destination, false)),
+        Err(error) => Err(format!("could not inspect document path: {error}")),
+    }
+}
+
+fn load_document(path: &FsPath) -> Result<(Document, Option<[f32; 2]>), String> {
+    let bytes = fs::read(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    Document::deserialize_from_bytes(&bytes)
+        .map_err(|error| format!("could not load {}: {error}", path.display()))
+}
+
 fn main() {
+    let mut arguments = std::env::args_os();
+    let _program = arguments.next();
+    let document_argument = arguments.next();
+    if arguments.next().is_some() {
+        eprintln!("usage: mathcanvas [relative-document-path]");
+        std::process::exit(2);
+    }
+
+    let (document_path, document, initial_view_center, loaded_existing_document) = match document_argument {
+        Some(argument) => {
+            let (path, exists) = match resolve_document_path(&argument) {
+                Ok(result) => result,
+                Err(error) => {
+                    eprintln!("mathcanvas: {error}");
+                    std::process::exit(1);
+                }
+            };
+
+            let (document, initial_view_center) = if exists {
+                match load_document(&path) {
+                    Ok(loaded) => loaded,
+                    Err(error) => {
+                        // Never fall back to an empty document here: doing so
+                        // could later autosave over a damaged or newer file.
+                        eprintln!("mathcanvas: {error}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                (Document::default(), None)
+            };
+
+            (Some(path), document, initial_view_center, exists)
+        }
+        None => (None, Document::default(), None, false),
+    };
+
     let event_loop = EventLoop::new().unwrap();
-    let app = MathCanvasApp::default();
+    let proxy = event_loop.create_proxy();
+    let app = match MathCanvasApp::new(
+        document,
+        document_path.clone(),
+        initial_view_center,
+        proxy,
+    ) {
+        Ok(app) => app,
+        Err(error) => {
+            eprintln!("mathcanvas: could not start autosave worker: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Some(path) = document_path {
+        if loaded_existing_document {
+            eprintln!("[math-canvas] loaded {}; autosaving enabled", path.display());
+        } else {
+            eprintln!(
+                "[math-canvas] new document; autosaving to {} after the first edit",
+                path.display()
+            );
+        }
+    } else {
+        eprintln!("[math-canvas] temporary canvas; autosaving is disabled");
+    }
+
     event_loop.run_app(app).unwrap();
 }
