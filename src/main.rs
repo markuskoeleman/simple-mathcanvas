@@ -1,12 +1,16 @@
 use serde::ser::SerializeSeq;
+use font8x8::{BASIC_FONTS, LATIN_FONTS, UnicodeFonts};
 use serde::{Deserialize, Serialize};
 use softbuffer::{Context, Rect, Surface};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fmt;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Component, Path as FsPath, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::num::NonZeroU32;
@@ -17,11 +21,124 @@ use winit::application::ApplicationHandler;
 use winit::cursor::{Cursor, CursorIcon, CustomCursorSource};
 use winit::dpi::PhysicalPosition;
 use winit::event::{
-    ButtonSource, ElementState, KeyEvent, MouseButton, WindowEvent,
+    ButtonSource, ElementState, Ime, KeyEvent, MouseButton, WindowEvent,
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{
+    ImeCapabilities, ImeEnableRequest, ImeRequest, ImeRequestData, Window, WindowAttributes,
+    WindowId,
+};
+
+// A detached GUI process has no terminal to report errors to. Keep errors in
+// the user's state directory, while allowing --foreground to mirror them to
+// the terminal during development and troubleshooting.
+const INTERNAL_DETACHED_ENV: &str = "MATHCANVAS_INTERNAL_DETACHED";
+static SHOW_ERRORS_ON_STDERR: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn setsid() -> i32;
+}
+
+macro_rules! debug_log {
+    ($($arg:tt)*) => {{
+        #[cfg(debug_assertions)]
+        eprintln!($($arg)*);
+    }};
+}
+
+macro_rules! error_log {
+    ($($arg:tt)*) => {{
+        log_error(format_args!($($arg)*));
+    }};
+}
+
+fn application_log_path() -> Option<PathBuf> {
+    let state_home = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".local").join("state"))
+        })?;
+
+    Some(state_home.join("mathcanvas").join("mathcanvas.log"))
+}
+
+fn open_application_log() -> io::Result<std::fs::File> {
+    let path = application_log_path().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "neither an absolute XDG_STATE_HOME nor HOME is available",
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
+fn log_error(arguments: fmt::Arguments<'_>) {
+    let message = format!("[math-canvas] ERROR: {arguments}");
+    if SHOW_ERRORS_ON_STDERR.load(Ordering::Relaxed) {
+        eprintln!("{message}");
+    }
+
+    match open_application_log() {
+        Ok(mut file) => {
+            let _ = writeln!(file, "{message}");
+        }
+        Err(error) => {
+            // In a detached launch stderr is the already-open log file, so it
+            // remains a useful fallback if the path is later unavailable.
+            eprintln!("[math-canvas] could not write the application log: {error}");
+        }
+    }
+}
+
+fn standard_streams_are_terminal() -> bool {
+    std::io::stdin().is_terminal()
+        || std::io::stdout().is_terminal()
+        || std::io::stderr().is_terminal()
+}
+
+#[cfg(unix)]
+fn spawn_detached(arguments: &[OsString]) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let executable = std::env::current_exe()?;
+    // Refuse to detach without a place to record diagnostics. This avoids
+    // starting a GUI process whose startup or save errors would be invisible.
+    let child_stderr = Stdio::from(open_application_log()?);
+
+    let mut command = Command::new(executable);
+    command
+        .args(arguments)
+        .env(INTERNAL_DETACHED_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(child_stderr);
+
+    // `pre_exec` runs in the child after fork and before exec. The only
+    // operation performed here is setsid(), which detaches the child from the
+    // launching terminal session. Keep this closure free of Rust allocation,
+    // locks, or environment access.
+    unsafe {
+        command.pre_exec(|| {
+            // SAFETY: setsid() is a POSIX process/session operation and does
+            // not access Rust-managed state in the post-fork child.
+            if setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    // Dropping Child does not wait for or terminate the new process.
+    drop(command.spawn()?);
+    Ok(())
+}
 
 // Controls the density and smoothness of captured handwriting.
 // Sampling distance is measured in screen pixels, keeping input
@@ -59,7 +176,13 @@ const DEFAULT_FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // ~60 F
 // minute. Further edits do not move the deadline, so continuous writing cannot
 // postpone an autosave indefinitely.
 const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(60);
-const DOCUMENT_STORAGE_DIR: &str = "mathcanvas";
+const COMMAND_BAR_HEIGHT: u32 = 48;
+const COMMAND_FONT_SCALE: u32 = 2;
+const COMMAND_GLYPH_ADVANCE: usize = 18;
+const COMMAND_MAX_INPUT_BYTES: usize = 1024;
+// Relative Save As names are stored beneath ~/uni/mathcanvas. Command-line
+// arguments use their actual filesystem paths and do not use this root.
+const DOCUMENT_STORAGE_DIR: &str = "uni/mathcanvas";
 const DOCUMENT_EXTENSION: &str = "mathcanvas";
 const DOCUMENT_FILE_MAGIC: [u8; 8] = *b"MCANVAS\0";
 const DOCUMENT_FORMAT_VERSION: u16 = 2;
@@ -1960,6 +2083,7 @@ enum AutosaveCommand {
         request_id: u64,
         path: PathBuf,
         bytes: Vec<u8>,
+        replace_existing: bool,
     },
     Shutdown,
 }
@@ -1985,8 +2109,8 @@ impl AutosaveWorker {
             .spawn(move || {
                 while let Ok(command) = command_receiver.recv() {
                     match command {
-                        AutosaveCommand::Write { request_id, path, bytes } => {
-                            let result = write_file_atomically(&path, &bytes)
+                        AutosaveCommand::Write { request_id, path, bytes, replace_existing } => {
+                            let result = write_file_atomically(&path, &bytes, replace_existing)
                                 .map_err(|error| error.to_string());
                             let _ = completion_sender.send(AutosaveCompletion {
                                 request_id,
@@ -2036,7 +2160,7 @@ impl Drop for AutosaveWorker {
     }
 }
 
-fn write_file_atomically(destination: &FsPath, bytes: &[u8]) -> std::io::Result<()> {
+fn write_file_atomically(destination: &FsPath, bytes: &[u8], replace_existing: bool) -> std::io::Result<()> {
     let parent = destination
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -2070,9 +2194,22 @@ fn write_file_atomically(destination: &FsPath, bytes: &[u8]) -> std::io::Result<
         return Err(error);
     }
 
-    if let Err(error) = fs::rename(&temporary_path, destination) {
+    if replace_existing {
+        if let Err(error) = fs::rename(&temporary_path, destination) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error);
+        }
+    } else {
+        // Save As must never replace a file which appeared after path
+        // validation. A same-directory hard link installs the fully-written
+        // temporary inode atomically and fails when the destination exists.
+        if let Err(error) = fs::hard_link(&temporary_path, destination) {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error);
+        }
+        // The destination now owns the complete file. Failure to remove this
+        // extra temporary name is harmless to the document itself.
         let _ = fs::remove_file(&temporary_path);
-        return Err(error);
     }
 
     Ok(())
@@ -2085,6 +2222,7 @@ struct AutosaveState {
     deadline: Option<Instant>,
     save_in_progress: bool,
     in_flight_id: Option<u64>,
+    initial_save_request: Option<u64>,
     next_request_id: u64,
 }
 
@@ -2098,6 +2236,266 @@ impl AutosaveState {
             self.deadline = Some(Instant::now() + AUTOSAVE_INTERVAL);
         }
     }
+}
+
+// The command bar is intentionally tiny: winit handles text input and a
+// built-in 8x8 bitmap font is painted directly into a small framebuffer strip.
+// It has no document/rendering dependencies and is only drawn while active.
+#[derive(Default)]
+struct CommandBar {
+    active: bool,
+    input: String,
+    cursor: usize,
+    preedit: String,
+    message: Option<String>,
+}
+
+impl CommandBar {
+    fn insert_text(&mut self, text: &str) {
+        let remaining = COMMAND_MAX_INPUT_BYTES.saturating_sub(self.input.len());
+        if remaining == 0 {
+            return;
+        }
+
+        let mut filtered = String::new();
+        for character in text.chars().filter(|character| !character.is_control()) {
+            if filtered.len() + character.len_utf8() > remaining {
+                break;
+            }
+            filtered.push(character);
+        }
+        if filtered.is_empty() {
+            return;
+        }
+
+        self.input.insert_str(self.cursor, &filtered);
+        self.cursor += filtered.len();
+        self.message = None;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let previous = self.input[..self.cursor]
+            .char_indices()
+            .last()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        self.input.drain(previous..self.cursor);
+        self.cursor = previous;
+        self.message = None;
+    }
+
+    fn delete_forward(&mut self) {
+        if self.cursor >= self.input.len() {
+            return;
+        }
+        let next = self.input[self.cursor..]
+            .chars()
+            .next()
+            .map(|ch| self.cursor + ch.len_utf8())
+            .unwrap_or(self.cursor);
+        self.input.drain(self.cursor..next);
+        self.message = None;
+    }
+
+    fn move_left(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        self.cursor = self.input[..self.cursor]
+            .char_indices()
+            .last()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+    }
+
+    fn move_right(&mut self) {
+        if self.cursor >= self.input.len() {
+            return;
+        }
+        self.cursor = self.input[self.cursor..]
+            .chars()
+            .next()
+            .map(|ch| self.cursor + ch.len_utf8())
+            .unwrap_or(self.input.len());
+    }
+
+    fn reset(&mut self) {
+        self.active = false;
+        self.input.clear();
+        self.cursor = 0;
+        self.preedit.clear();
+        self.message = None;
+    }
+}
+
+fn command_bar_rect(width: u32, height: u32) -> PixelRect {
+    let bar_height = height.min(COMMAND_BAR_HEIGHT);
+    PixelRect {
+        x0: 0,
+        y0: height.saturating_sub(bar_height),
+        x1: width,
+        y1: height,
+    }
+}
+
+fn fill_pixmap_rect(pixmap: &mut Pixmap, rect: PixelRect, color: [u8; 4]) {
+    let width = pixmap.width() as usize;
+    let height = pixmap.height() as usize;
+    let x0 = (rect.x0 as usize).min(width);
+    let x1 = (rect.x1 as usize).min(width);
+    let y0 = (rect.y0 as usize).min(height);
+    let y1 = (rect.y1 as usize).min(height);
+    let data = pixmap.data_mut();
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let index = (y * width + x) * 4;
+            data[index..index + 4].copy_from_slice(&color);
+        }
+    }
+}
+
+fn draw_bitmap_text(
+    pixmap: &mut Pixmap,
+    text: &str,
+    x: i32,
+    y: i32,
+    scale: u32,
+    color: [u8; 4],
+    clip: PixelRect,
+) {
+    let width = pixmap.width() as usize;
+    let height = pixmap.height() as usize;
+    let clip_x0 = clip.x0 as i32;
+    let clip_x1 = clip.x1 as i32;
+    let clip_y0 = clip.y0 as i32;
+    let clip_y1 = clip.y1 as i32;
+    let scale = scale.max(1) as i32;
+    let data = pixmap.data_mut();
+
+    for (character_index, character) in text.chars().enumerate() {
+        let glyph = BASIC_FONTS
+            .get(character)
+            .or_else(|| LATIN_FONTS.get(character))
+            .unwrap_or_else(|| BASIC_FONTS.get('?').unwrap_or([0; 8]));
+        let glyph_x = x + character_index as i32 * (8 * scale + scale);
+
+        for (row, bits) in glyph.iter().enumerate() {
+            for column in 0..8 {
+                if *bits & (1_u8 << column) == 0 {
+                    continue;
+                }
+                for dy in 0..scale {
+                    let py = y + row as i32 * scale + dy;
+                    if py < clip_y0 || py >= clip_y1 || py < 0 || py >= height as i32 {
+                        continue;
+                    }
+                    for dx in 0..scale {
+                        let px = glyph_x + column * scale + dx;
+                        if px < clip_x0 || px >= clip_x1 || px < 0 || px >= width as i32 {
+                            continue;
+                        }
+                        let index = (py as usize * width + px as usize) * 4;
+                        data[index..index + 4].copy_from_slice(&color);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn draw_command_bar(pixmap: &mut Pixmap, command_bar: &CommandBar) -> PixelRect {
+    let width = pixmap.width();
+    let height = pixmap.height();
+    let rect = command_bar_rect(width, height);
+    fill_pixmap_rect(pixmap, rect, [27, 30, 37, 255]);
+
+    if rect.y0 < rect.y1 {
+        fill_pixmap_rect(
+            pixmap,
+            PixelRect { x0: rect.x0, y0: rect.y0, x1: rect.x1, y1: rect.y0.saturating_add(1) },
+            [82, 96, 116, 255],
+        );
+    }
+
+    let text_y = rect.y0 as i32 + 8;
+    let prefix_x = 14;
+    draw_bitmap_text(
+        pixmap,
+        ":",
+        prefix_x,
+        text_y,
+        COMMAND_FONT_SCALE,
+        [132, 184, 255, 255],
+        rect,
+    );
+
+    let text_x = 34_i32;
+    let cursor_columns = command_bar.input[..command_bar.cursor].chars().count();
+    let cursor_offset = cursor_columns.saturating_mul(COMMAND_GLYPH_ADVANCE);
+    let available_width = width.saturating_sub(text_x.max(0) as u32 + 16) as usize;
+    let scroll = cursor_offset.saturating_sub(available_width.saturating_sub(COMMAND_GLYPH_ADVANCE));
+
+    for (index, character) in command_bar.input.chars().enumerate() {
+        let char_x = text_x + (index * COMMAND_GLYPH_ADVANCE) as i32 - scroll as i32;
+        draw_bitmap_text(
+            pixmap,
+            &character.to_string(),
+            char_x,
+            text_y,
+            COMMAND_FONT_SCALE,
+            [226, 231, 239, 255],
+            rect,
+        );
+    }
+
+    if !command_bar.preedit.is_empty() {
+        let preedit_x = text_x + cursor_offset as i32 - scroll as i32;
+        draw_bitmap_text(
+            pixmap,
+            &command_bar.preedit,
+            preedit_x,
+            text_y,
+            COMMAND_FONT_SCALE,
+            [150, 210, 220, 255],
+            rect,
+        );
+    }
+
+    let cursor_x = text_x + cursor_offset as i32 - scroll as i32;
+    fill_pixmap_rect(
+        pixmap,
+        PixelRect {
+            x0: cursor_x.max(rect.x0 as i32) as u32,
+            y0: rect.y0.saturating_add(8),
+            x1: (cursor_x + 2).max(rect.x0 as i32).min(rect.x1 as i32) as u32,
+            y1: rect.y0.saturating_add(25).min(rect.y1),
+        },
+        [132, 184, 255, 255],
+    );
+
+    let hint = command_bar
+        .message
+        .as_deref()
+        .unwrap_or("saveas <relative-path>    Enter: run    Esc: cancel");
+    let hint_color = if command_bar.message.is_some() {
+        [255, 145, 128, 255]
+    } else {
+        [145, 154, 168, 255]
+    };
+    draw_bitmap_text(
+        pixmap,
+        hint,
+        14,
+        rect.y0 as i32 + 32,
+        1,
+        hint_color,
+        rect,
+    );
+
+    rect
 }
 
 // --- Application & Two-Stage Rendering State ---
@@ -2119,7 +2517,12 @@ struct MathCanvasApp {
     last_present: Option<Instant>,
     autosave: AutosaveState,
     autosave_worker: Option<AutosaveWorker>,
+    event_loop_proxy: Option<EventLoopProxy>,
     initial_view_center: Option<[f32; 2]>,
+    command_bar: CommandBar,
+    // Defer IME shutdown until the command bar's cleared frame has actually
+    // been presented. This keeps platform IME work from delaying its dismissal.
+    disable_ime_after_redraw: bool,
     #[cfg(debug_assertions)]
     presents_in_window: u32,
     #[cfg(debug_assertions)]
@@ -2143,7 +2546,10 @@ impl Default for MathCanvasApp {
             last_present: None,
             autosave: AutosaveState::default(),
             autosave_worker: None,
+            event_loop_proxy: None,
             initial_view_center: None,
+            command_bar: CommandBar::default(),
+            disable_ime_after_redraw: false,
             #[cfg(debug_assertions)]
             presents_in_window: 0,
             #[cfg(debug_assertions)]
@@ -2163,6 +2569,7 @@ impl MathCanvasApp {
         app.document = document;
         app.autosave.path = path;
         app.initial_view_center = initial_view_center;
+        app.event_loop_proxy = Some(proxy.clone());
         if app.autosave.path.is_some() {
             app.autosave_worker = Some(AutosaveWorker::spawn(proxy)?);
         }
@@ -2215,6 +2622,225 @@ impl MathCanvasApp {
         self.autosave.mark_dirty();
     }
 
+    fn command_bar_region(&self) -> Option<PixelRect> {
+        let (width, height) = self.presenter.frame_dimensions()?;
+        Some(command_bar_rect(width, height))
+    }
+
+    // Restore the canvas beneath the command bar before repainting the overlay.
+    // This keeps command UI out of the persistent tile cache and document data.
+    fn refresh_command_bar(&mut self) {
+        let Some(rect) = self.command_bar_region() else {
+            return;
+        };
+        if !self.view_mode.is_overview() {
+            self.composite_tiles_into_frame(rect);
+        }
+        if self.command_bar.active {
+            if let Some(frame) = self.presenter.frame_mut() {
+                draw_command_bar(frame, &self.command_bar);
+            }
+        }
+        self.presenter.add_damage(rect);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn set_command_bar_ime_enabled(&self, enabled: bool) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+
+        let request = if enabled {
+            // The command bar currently doesn't provide IME cursor-area,
+            // surrounding-text, or hint metadata. An empty capability set
+            // preserves the old IME-enable behavior without advertising
+            // metadata that we do not actually supply.
+            let enable_request = ImeEnableRequest::new(
+                ImeCapabilities::new(),
+                ImeRequestData::default(),
+            )
+            .expect("empty IME capabilities and request data are compatible");
+            ImeRequest::Enable(enable_request)
+        } else {
+            ImeRequest::Disable
+        };
+
+        if let Err(error) = window.request_ime_update(request) {
+            error_log!(
+                "failed to {} IME for command bar: {error:?}",
+                if enabled { "enable" } else { "disable" }
+            );
+        }
+    }
+
+    fn open_command_bar(&mut self) {
+        if self.command_bar.active
+            || self.view_mode.is_overview()
+            || !matches!(&self.interaction.mode, InteractionMode::Idle)
+        {
+            return;
+        }
+        self.command_bar.active = true;
+        self.command_bar.input.clear();
+        self.command_bar.cursor = 0;
+        self.command_bar.preedit.clear();
+        self.command_bar.message = None;
+        self.set_command_bar_ime_enabled(true);
+        self.refresh_command_bar();
+    }
+
+    // Escape and successful command execution use the deferred variant so the
+    // cleared command-bar strip is presented before asking the platform IME to
+    // shut down. Focus loss uses the immediate variant below.
+    fn close_command_bar_after_redraw(&mut self) {
+        if !self.command_bar.active {
+            return;
+        }
+        self.command_bar.reset();
+        self.disable_ime_after_redraw = true;
+        self.refresh_command_bar();
+    }
+
+    fn close_command_bar(&mut self) {
+        let was_active = self.command_bar.active;
+        if !was_active && !self.disable_ime_after_redraw {
+            return;
+        }
+        self.command_bar.reset();
+        self.disable_ime_after_redraw = false;
+        self.set_command_bar_ime_enabled(false);
+        if was_active {
+            self.refresh_command_bar();
+        }
+    }
+
+    fn save_as_document(&mut self, requested_path: &str) -> Result<PathBuf, String> {
+        if self.autosave.path.is_some() {
+            return Err(
+                "this canvas already has an associated file; Save As currently applies to temporary canvases"
+                    .to_owned(),
+            );
+        }
+        let requested_path = requested_path.trim();
+        if requested_path.is_empty() {
+            return Err("usage: :saveas <relative-document-path>".to_owned());
+        }
+
+        let (path, exists) = resolve_save_as_document_path(OsStr::new(requested_path))?;
+        if exists {
+            return Err(format!(
+                "{} already exists; choose a different document name",
+                path.display()
+            ));
+        }
+
+        // Serialize before associating the path. If serialization or worker
+        // startup fails, the canvas remains a normal temporary document.
+        let bytes = self.serialize_snapshot_for_save()?;
+        if self.autosave_worker.is_none() {
+            let proxy = self
+                .event_loop_proxy
+                .as_ref()
+                .ok_or_else(|| "event loop is unavailable; cannot start autosaving".to_owned())?
+                .clone();
+            let worker = AutosaveWorker::spawn(proxy)
+                .map_err(|error| format!("could not start autosave worker: {error}"))?;
+            self.autosave_worker = Some(worker);
+        }
+
+        let request_id = self.autosave.next_request_id;
+        let send_result = self
+            .autosave_worker
+            .as_ref()
+            .expect("worker was created above")
+            .command_sender
+            .send(AutosaveCommand::Write {
+                request_id,
+                path: path.clone(),
+                bytes,
+                replace_existing: false,
+            });
+
+        if let Err(error) = send_result {
+            self.autosave_worker.take();
+            return Err(format!("could not queue initial document save: {error}"));
+        }
+
+        self.autosave.next_request_id = request_id.wrapping_add(1);
+        self.autosave.path = Some(path.clone());
+        self.autosave.dirty = false;
+        self.autosave.deadline = None;
+        self.autosave.save_in_progress = true;
+        self.autosave.in_flight_id = Some(request_id);
+        self.autosave.initial_save_request = Some(request_id);
+        Ok(path)
+    }
+
+    fn execute_command_bar(&mut self) {
+        let line = self.command_bar.input.trim().to_owned();
+        let command_end = line
+            .find(char::is_whitespace)
+            .unwrap_or(line.len());
+        let command = &line[..command_end];
+        let argument = line[command_end..].trim();
+
+        let result = match command {
+            "saveas" => self.save_as_document(argument),
+            _ => Err("unknown command; available command: :saveas <relative-document-path>".to_owned()),
+        };
+
+        match result {
+            Ok(_path) => {
+                debug_log!(
+                    "[math-canvas] initial save queued to {}; autosaving enabled",
+                    _path.display()
+                );
+                self.close_command_bar_after_redraw();
+            }
+            Err(error) => {
+                self.command_bar.message = Some(error);
+                self.refresh_command_bar();
+            }
+        }
+    }
+
+    fn handle_command_bar_key(&mut self, key: Key, pressed: bool) {
+        if !pressed {
+            return;
+        }
+        match key {
+            Key::Named(NamedKey::Escape) => self.close_command_bar_after_redraw(),
+            Key::Named(NamedKey::Enter) => self.execute_command_bar(),
+            Key::Named(NamedKey::Backspace) => {
+                self.command_bar.backspace();
+                self.refresh_command_bar();
+            }
+            Key::Named(NamedKey::Delete) => {
+                self.command_bar.delete_forward();
+                self.refresh_command_bar();
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                self.command_bar.move_left();
+                self.refresh_command_bar();
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                self.command_bar.move_right();
+                self.refresh_command_bar();
+            }
+            Key::Named(NamedKey::Home) => {
+                self.command_bar.cursor = 0;
+                self.refresh_command_bar();
+            }
+            Key::Named(NamedKey::End) => {
+                self.command_bar.cursor = self.command_bar.input.len();
+                self.refresh_command_bar();
+            }
+            _ => {}
+        }
+    }
+
     fn start_autosave_if_due(&mut self, now: Instant) {
         if !self.autosave.dirty || self.autosave.save_in_progress {
             return;
@@ -2237,7 +2863,7 @@ impl MathCanvasApp {
         let bytes = match self.serialize_snapshot_for_save() {
             Ok(bytes) => bytes,
             Err(error) => {
-                eprintln!("[math-canvas] document serialization failed: {error}");
+                error_log!("document serialization failed: {error}");
                 self.autosave.deadline = Some(now + AUTOSAVE_INTERVAL);
                 return;
             }
@@ -2248,6 +2874,7 @@ impl MathCanvasApp {
             request_id,
             path,
             bytes,
+            replace_existing: true,
         }) {
             Ok(()) => {
                 self.autosave.next_request_id = request_id.wrapping_add(1);
@@ -2257,7 +2884,7 @@ impl MathCanvasApp {
                 self.autosave.in_flight_id = Some(request_id);
             }
             Err(error) => {
-                eprintln!("[math-canvas] could not queue autosave: {error}");
+                error_log!("could not queue autosave: {error}");
                 self.autosave.deadline = Some(now + AUTOSAVE_INTERVAL);
             }
         }
@@ -2274,13 +2901,30 @@ impl MathCanvasApp {
             if self.autosave.in_flight_id != Some(completion.request_id) {
                 continue;
             }
+            let was_initial_save =
+                self.autosave.initial_save_request == Some(completion.request_id);
+            if was_initial_save {
+                self.autosave.initial_save_request = None;
+            }
             self.autosave.save_in_progress = false;
             self.autosave.in_flight_id = None;
 
             match completion.result {
-                Ok(()) => eprintln!("[math-canvas] autosaved"),
+                Ok(()) if was_initial_save => {
+                    debug_log!("[math-canvas] Save As completed; autosaving enabled");
+                }
+                Ok(()) => debug_log!("[math-canvas] autosaved"),
+                Err(error) if was_initial_save => {
+                    error_log!("Save As failed; canvas remains temporary: {error}");
+                    // The initial create is deliberately no-clobber. If it
+                    // failed, detach the path so no later autosave can replace
+                    // a file that appeared at the destination in the meantime.
+                    self.autosave.path = None;
+                    self.autosave.deadline = None;
+                    self.autosave.dirty = true;
+                }
                 Err(error) => {
-                    eprintln!("[math-canvas] autosave failed: {error}");
+                    error_log!("autosave failed: {error}");
                     // If no newer edit arrived during the failed save, restore
                     // the dirty state and retry after another interval. Otherwise
                     // retain the deadline already started by that newer edit.
@@ -2298,11 +2942,58 @@ impl MathCanvasApp {
     }
 
     fn save_and_stop_worker(&mut self) {
+        // Save As initially creates the destination without replacing anything.
+        // If the window closes before that operation completes, wait for its
+        // result before deciding whether a replace-existing final snapshot is
+        // safe. Otherwise an initial no-clobber failure could be followed by a
+        // final save that overwrites a file which appeared at the destination.
+        if let Some(initial_request) = self.autosave.initial_save_request {
+            let initial_result = self
+                .autosave_worker
+                .as_ref()
+                .and_then(|worker| {
+                    loop {
+                        match worker.completion_receiver.recv() {
+                            Ok(completion) if completion.request_id == initial_request => {
+                                break Some(completion.result);
+                            }
+                            // There should be no other outstanding request while
+                            // the initial Save As is in flight, but ignore any
+                            // unrelated stale completion defensively.
+                            Ok(_) => continue,
+                            Err(_) => break None,
+                        }
+                    }
+                });
+
+            self.autosave.initial_save_request = None;
+            self.autosave.save_in_progress = false;
+            self.autosave.in_flight_id = None;
+
+            match initial_result {
+                Some(Ok(())) => {
+                    debug_log!("[math-canvas] initial Save As completed during shutdown");
+                }
+                Some(Err(error)) => {
+                    error_log!("initial Save As failed during shutdown: {error}");
+                    self.autosave.path = None;
+                    self.autosave.dirty = true;
+                    self.autosave.deadline = None;
+                }
+                None => {
+                    error_log!("autosave worker exited before confirming initial Save As");
+                    self.autosave.path = None;
+                    self.autosave.dirty = true;
+                    self.autosave.deadline = None;
+                }
+            }
+        }
+
         // Always queue one final snapshot for an associated document, even when
         // no strokes are dirty. This captures view-only navigation since the
         // previous autosave without making camera movement trigger a save.
         // FIFO worker ordering ensures this is the last snapshot renamed into place.
-        let mut awaited_request = self.autosave.in_flight_id;
+        let mut awaited_request = None;
         let mut final_snapshot_queued = false;
 
         if let (Some(path), Some(worker)) = (
@@ -2316,6 +3007,7 @@ impl MathCanvasApp {
                         request_id,
                         path,
                         bytes,
+                        replace_existing: true,
                     }) {
                         Ok(()) => {
                             awaited_request = Some(request_id);
@@ -2327,23 +3019,23 @@ impl MathCanvasApp {
                             self.autosave.in_flight_id = Some(request_id);
                         }
                         Err(error) => {
-                            eprintln!("[math-canvas] could not queue final save: {error}");
+                            error_log!("could not queue final save: {error}");
                         }
                     }
                 }
                 Err(error) => {
-                    eprintln!("[math-canvas] final document serialization failed: {error}");
+                    error_log!("final document serialization failed: {error}");
                 }
             }
         }
 
         if self.autosave.dirty && self.autosave.path.is_some() && !final_snapshot_queued {
-            eprintln!("[math-canvas] closing with document changes that could not be queued for saving");
+            error_log!("closing with document changes that could not be queued for saving");
         }
 
         if let Some(worker) = self.autosave_worker.as_mut() {
             if let Err(error) = worker.shutdown_and_join() {
-                eprintln!("[math-canvas] autosave worker shutdown failed: {error}");
+                error_log!("autosave worker shutdown failed: {error}");
             }
 
             let mut awaited_result = None;
@@ -2355,9 +3047,9 @@ impl MathCanvasApp {
 
             if awaited_request.is_some() {
                 match awaited_result {
-                    Some(Ok(())) => eprintln!("[math-canvas] final autosave completed"),
-                    Some(Err(error)) => eprintln!("[math-canvas] final autosave failed: {error}"),
-                    None => eprintln!("[math-canvas] autosave worker exited without confirming the final save"),
+                    Some(Ok(())) => debug_log!("[math-canvas] final autosave completed"),
+                    Some(Err(error)) => error_log!("final autosave failed: {error}"),
+                    None => error_log!("autosave worker exited without confirming the final save"),
                 }
             }
         }
@@ -2655,7 +3347,7 @@ impl MathCanvasApp {
         let source = match CustomCursorSource::from_rgba(rgba, size, size, size / 2, size / 2) {
             Ok(source) => source,
             Err(err) => {
-                eprintln!("Failed to create brush cursor image: {err:?}");
+                error_log!("failed to create brush cursor image: {err:?}");
                 return;
             }
         };
@@ -2664,7 +3356,7 @@ impl MathCanvasApp {
         let cursor = match event_loop.create_custom_cursor(source) {
             Ok(cursor) => cursor,
             Err(err) => {
-                eprintln!("Failed to create platform cursor: {err:?}");
+                error_log!("failed to create platform cursor: {err:?}");
                 return;
             }
         };
@@ -2874,7 +3566,7 @@ impl MathCanvasApp {
                     if elapsed >= Duration::from_secs(1) {
                         let presents_per_second =
                             f64::from(self.presents_in_window) / elapsed.as_secs_f64();
-                        eprintln!("[math-canvas] presents: {presents_per_second:.1} FPS");
+                        debug_log!("[math-canvas] presents: {presents_per_second:.1} FPS");
                         self.presents_in_window = 0;
                         self.present_window_started = Some(Instant::now());
                     }
@@ -2923,8 +3615,22 @@ impl MathCanvasApp {
                 self.presenter.add_damage(damage);
             }
         }
-        if self.render() {
+        if self.command_bar.active {
+            if let (Some(rect), Some(frame)) = (self.command_bar_region(), self.presenter.frame_mut()) {
+                draw_command_bar(frame, &self.command_bar);
+                self.presenter.add_damage(rect);
+            }
+        }
+        let presented = self.render();
+        if presented {
             self.record_successful_present(started);
+
+            // The command bar is now visibly gone. Disable the IME afterwards
+            // so any platform-side text-input shutdown cannot delay that frame.
+            if self.disable_ime_after_redraw {
+                self.disable_ime_after_redraw = false;
+                self.set_command_bar_ime_enabled(false);
+            }
         }
     }
 }
@@ -3063,13 +3769,56 @@ impl ApplicationHandler for MathCanvasApp {
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.interaction.inputs.shift = modifiers.state().shift_key();
             }
+            WindowEvent::Ime(ime) => {
+                if self.command_bar.active {
+                    match ime {
+                        Ime::Commit(text) => {
+                            self.command_bar.preedit.clear();
+                            self.command_bar.insert_text(&text);
+                            self.refresh_command_bar();
+                        }
+                        Ime::Preedit(text, _) => {
+                            self.command_bar.preedit = text;
+                            self.refresh_command_bar();
+                        }
+                        Ime::Disabled => {
+                            self.command_bar.preedit.clear();
+                            self.refresh_command_bar();
+                        }
+                        Ime::Enabled => {},
+                        _ => {}
+                    }
+                }
+            }
             WindowEvent::KeyboardInput {
                 event: KeyEvent {
-                    logical_key, state, ..
+                    logical_key, state, text, ..
                 },
                 ..
             } => {
                 let pressed = state == ElementState::Pressed;
+
+                // While the command bar is active, all keyboard input belongs
+                // to it. In particular, F and the canvas shortcuts must not
+                // leak through to the drawing surface. Printable text arrives
+                // through Winit's IME Commit events.
+                if self.command_bar.active {
+                    if pressed {
+                        if let Some(text) = text {
+                            self.command_bar.insert_text(text.as_str());
+                            self.refresh_command_bar();
+                        }
+                    }
+                    self.handle_command_bar_key(logical_key, pressed);
+                    return;
+                }
+
+                // ':' opens the one-line command prompt when no canvas gesture
+                // is in progress. The colon itself is rendered as the prompt.
+                if pressed && matches!(&logical_key, Key::Character(text) if text == ":") {
+                    self.open_command_bar();
+                    return;
+                }
 
                 // F is edge-triggered so keyboard auto-repeat cannot rapidly
                 // toggle between views. Its release is handled in either mode.
@@ -3167,6 +3916,9 @@ impl ApplicationHandler for MathCanvasApp {
                 primary: true,
                 ..
             } => {
+                if self.command_bar.active {
+                    return;
+                }
                 let is_primary_press = matches!(
                     button,
                     ButtonSource::Mouse(MouseButton::Left)
@@ -3319,6 +4071,9 @@ impl ApplicationHandler for MathCanvasApp {
                 primary: true,
                 ..
             } => {
+                if self.command_bar.active {
+                    return;
+                }
                 if self.overview_pointer_suppressed {
                     // The pointer may continue moving while the overview-selecting
                     // press is held. Track its screen position, but never draw,
@@ -3385,6 +4140,7 @@ impl ApplicationHandler for MathCanvasApp {
             WindowEvent::Focused(false) => {
                 // Focus changes can suppress release events. Reset held-key
                 // bookkeeping; overview itself remains visible and read-only.
+                self.close_command_bar();
                 self.interaction.inputs = HeldInputs::default();
                 self.overview_toggle_down = false;
                 self.overview_pointer_suppressed = false;
@@ -3402,7 +4158,7 @@ impl ApplicationHandler for MathCanvasApp {
         }
     }
 }
-fn resolve_document_path(argument: &OsStr) -> Result<(PathBuf, bool), String> {
+fn resolve_save_as_document_path(argument: &OsStr) -> Result<(PathBuf, bool), String> {
     let relative_path = FsPath::new(argument);
     if relative_path.as_os_str().is_empty() || relative_path.is_absolute() {
         return Err("document path must be a non-empty relative path".to_owned());
@@ -3451,10 +4207,87 @@ fn resolve_document_path(argument: &OsStr) -> Result<(PathBuf, bool), String> {
     // Reject directory symlinks which would otherwise let a relative name
     // escape the dedicated storage root.
     if !canonical_parent.starts_with(&canonical_root) {
-        return Err("document path resolves outside ~/mathcanvas".to_owned());
+        return Err(format!("document path resolves outside ~/{}", DOCUMENT_STORAGE_DIR));
     }
 
     let destination = canonical_parent.join(file_name);
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "{} is a symbolic link; document symlinks are not supported",
+            destination.display()
+        )),
+        Ok(metadata) if !metadata.is_file() => Err(format!(
+            "{} exists but is not a regular file",
+            destination.display()
+        )),
+        Ok(_) => Ok((destination, true)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((destination, false)),
+        Err(error) => Err(format!("could not inspect document path: {error}")),
+    }
+}
+
+// Resolve a command-line argument as a real filesystem path. Unlike :saveas,
+// command-line paths are not rooted under DOCUMENT_STORAGE_DIR: absolute paths
+// remain absolute, relative paths are relative to the process working directory,
+// and a leading ~/ is expanded using the current user's home directory.
+fn resolve_command_line_document_path(argument: &OsStr) -> Result<(PathBuf, bool), String> {
+    let requested = FsPath::new(argument);
+    if requested.as_os_str().is_empty() {
+        return Err("document path must not be empty".to_owned());
+    }
+
+    let starts_with_home_marker = requested
+        .components()
+        .next()
+        .is_some_and(|component| component == Component::Normal(OsStr::new("~")));
+    let expanded = if starts_with_home_marker {
+        let remainder = requested
+            .strip_prefix("~")
+            .map_err(|error| format!("could not expand home-relative path: {error}"))?;
+        if remainder.as_os_str().is_empty() {
+            return Err("a home directory is not a document path; include a filename after ~/".to_owned());
+        }
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .ok_or_else(|| "HOME is not set; cannot expand ~/ in document path".to_owned())?;
+        PathBuf::from(home).join(remainder)
+    } else if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("could not determine current directory: {error}"))?
+            .join(requested)
+    };
+
+    let mut expanded = expanded;
+    match expanded.extension() {
+        None => {
+            expanded.set_extension(DOCUMENT_EXTENSION);
+        }
+        Some(extension) if extension == OsStr::new(DOCUMENT_EXTENSION) => {}
+        Some(_) => {
+            return Err(format!(
+                "document extension must be .{DOCUMENT_EXTENSION} (or omitted)"
+            ));
+        }
+    }
+
+    let file_name = expanded
+        .file_name()
+        .ok_or_else(|| "document path must include a filename".to_owned())?;
+    let parent = expanded
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| FsPath::new("."));
+
+    // Create missing parent directories, matching :saveas behaviour, but do
+    // not constrain the resulting path to the application's default save root.
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create document directory {}: {error}", parent.display()))?;
+    let canonical_parent = fs::canonicalize(parent)
+        .map_err(|error| format!("could not resolve document directory {}: {error}", parent.display()))?;
+    let destination = canonical_parent.join(file_name);
+
     match fs::symlink_metadata(&destination) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
             "{} is a symbolic link; document symlinks are not supported",
@@ -3478,42 +4311,73 @@ fn load_document(path: &FsPath) -> Result<(Document, Option<[f32; 2]>), String> 
 }
 
 fn main() {
-    let mut arguments = std::env::args_os();
-    let _program = arguments.next();
-    let document_argument = arguments.next();
-    if arguments.next().is_some() {
-        eprintln!("usage: mathcanvas [relative-document-path]");
+    let mut arguments: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let force_foreground = arguments
+        .first()
+        .is_some_and(|argument| argument == OsStr::new("--foreground"));
+    if force_foreground {
+        arguments.remove(0);
+    }
+
+    if arguments.len() > 1 {
+        SHOW_ERRORS_ON_STDERR.store(true, Ordering::Relaxed);
+        error_log!("usage: mathcanvas [--foreground] [document-path] (absolute or relative to the current directory)");
         std::process::exit(2);
     }
 
-    let (document_path, document, initial_view_center, loaded_existing_document) = match document_argument {
-        Some(argument) => {
-            let (path, exists) = match resolve_document_path(&argument) {
-                Ok(result) => result,
-                Err(error) => {
-                    eprintln!("mathcanvas: {error}");
-                    std::process::exit(1);
-                }
-            };
+    let already_detached = std::env::var_os(INTERNAL_DETACHED_ENV)
+        .is_some_and(|value| value == OsStr::new("1"));
+    let terminal_attached = standard_streams_are_terminal();
+    let show_errors_on_stderr = force_foreground || (terminal_attached && !already_detached);
+    SHOW_ERRORS_ON_STDERR.store(show_errors_on_stderr, Ordering::Relaxed);
 
-            let (document, initial_view_center) = if exists {
-                match load_document(&path) {
-                    Ok(loaded) => loaded,
+    // A terminal launch becomes a short-lived parent process. The independent
+    // child inherits the working directory, environment, and document args,
+    // but gets a new session and disconnected standard streams. Desktop
+    // launches have no terminal and run directly; --foreground opts out.
+    #[cfg(unix)]
+    if terminal_attached && !force_foreground && !already_detached {
+        if let Err(error) = spawn_detached(&arguments) {
+            error_log!("could not launch detached MathCanvas process: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    std::panic::set_hook(Box::new(|panic_info| {
+        error_log!("panic: {panic_info}");
+    }));
+
+    let document_argument = arguments.into_iter().next();
+    let (document_path, document, initial_view_center, loaded_existing_document) =
+        match document_argument {
+            Some(argument) => {
+                let (path, exists) = match resolve_command_line_document_path(&argument) {
+                    Ok(result) => result,
                     Err(error) => {
-                        // Never fall back to an empty document here: doing so
-                        // could later autosave over a damaged or newer file.
-                        eprintln!("mathcanvas: {error}");
+                        error_log!("{error}");
                         std::process::exit(1);
                     }
-                }
-            } else {
-                (Document::default(), None)
-            };
+                };
 
-            (Some(path), document, initial_view_center, exists)
-        }
-        None => (None, Document::default(), None, false),
-    };
+                let (document, initial_view_center) = if exists {
+                    match load_document(&path) {
+                        Ok(loaded) => loaded,
+                        Err(error) => {
+                            // Never fall back to an empty document here: doing so
+                            // could later autosave over a damaged or newer file.
+                            error_log!("{error}");
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    (Document::default(), None)
+                };
+
+                (Some(path), document, initial_view_center, exists)
+            }
+            None => (None, Document::default(), None, false),
+        };
 
     let event_loop = EventLoop::new().unwrap();
     let proxy = event_loop.create_proxy();
@@ -3525,22 +4389,22 @@ fn main() {
     ) {
         Ok(app) => app,
         Err(error) => {
-            eprintln!("mathcanvas: could not start autosave worker: {error}");
+            error_log!("could not start autosave worker: {error}");
             std::process::exit(1);
         }
     };
 
-    if let Some(path) = document_path {
+    if let Some(_path) = document_path {
         if loaded_existing_document {
-            eprintln!("[math-canvas] loaded {}; autosaving enabled", path.display());
+            debug_log!("[math-canvas] loaded {}; autosaving enabled", _path.display());
         } else {
-            eprintln!(
+            debug_log!(
                 "[math-canvas] new document; autosaving to {} after the first edit",
-                path.display()
+                _path.display()
             );
         }
     } else {
-        eprintln!("[math-canvas] temporary canvas; autosaving is disabled");
+        debug_log!("[math-canvas] temporary canvas; autosaving is disabled");
     }
 
     event_loop.run_app(app).unwrap();

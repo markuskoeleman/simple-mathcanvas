@@ -9,6 +9,7 @@ tiny-skia = "0.12"
 softbuffer = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 postcard = { version = "1.2", default-features = false, features = ["alloc"] }
+font8x8 = "0.3"
 
 [profile.dev]
 opt-level = 3
