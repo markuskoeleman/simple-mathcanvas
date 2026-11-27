@@ -1210,14 +1210,56 @@ impl TileRenderer {
         let Some((stroke, path)) = document.stroke_render_data(stroke_id) else {
             return;
         };
+
+        // A stroke usually affects only a handful of tiles. Look those up
+        // directly instead of scanning the entire cache. For unusually large
+        // stroke bounds (for example, a long diagonal), scanning the cache is
+        // cheaper than probing every coordinate in the bounding rectangle.
+        // Both paths use the same inclusive tile-boundary convention as
+        // tile_coords_for_bounds() and tile_overlaps_bounds().
+        let min_x_floor = (bounds[0] / TILE_SIZE_WORLD).floor() as i32;
+        let min_y_floor = (bounds[1] / TILE_SIZE_WORLD).floor() as i32;
+        // The existing overlap test is inclusive: a bounds minimum that lands
+        // exactly on a tile edge also touches the tile immediately before it.
+        // Preserve that conservative edge behaviour in the direct lookup range.
+        let min_x = if bounds[0] == min_x_floor as f32 * TILE_SIZE_WORLD {
+            min_x_floor.saturating_sub(1)
+        } else {
+            min_x_floor
+        };
+        let min_y = if bounds[1] == min_y_floor as f32 * TILE_SIZE_WORLD {
+            min_y_floor.saturating_sub(1)
+        } else {
+            min_y_floor
+        };
+        let max_x = (bounds[2] / TILE_SIZE_WORLD).floor() as i32;
+        let max_y = (bounds[3] / TILE_SIZE_WORLD).floor() as i32;
+        let columns = (i64::from(max_x) - i64::from(min_x) + 1).max(0) as u64;
+        let rows = (i64::from(max_y) - i64::from(min_y) + 1).max(0) as u64;
+        let candidate_tiles = columns.saturating_mul(rows);
+        let cached_tiles = self.rendered_tiles.len() as u64;
         let use_stamp = self.touch_clock();
 
-        // There is only one writing raster scale, so every overlapping cached
-        // tile can be updated directly with the same integer-aligned transform.
-        for (&coord, tile) in self.rendered_tiles.iter_mut() {
-            if Self::tile_overlaps_bounds(coord, bounds) {
-                tile.last_used = use_stamp;
-                stroke.draw_to_pixmap(path, &mut tile.pixmap, tile_transform(coord));
+        if candidate_tiles <= cached_tiles {
+            // Common case: small stroke bounds, a few hash lookups, and no
+            // temporary Vec allocation.
+            for y in min_y..=max_y {
+                for x in min_x..=max_x {
+                    let coord = TileCoord { x, y };
+                    if let Some(tile) = self.rendered_tiles.get_mut(&coord) {
+                        tile.last_used = use_stamp;
+                        stroke.draw_to_pixmap(path, &mut tile.pixmap, tile_transform(coord));
+                    }
+                }
+            }
+        } else {
+            // Pathological large bounds: only inspect existing cache entries,
+            // rather than iterating a potentially enormous empty tile range.
+            for (&coord, tile) in self.rendered_tiles.iter_mut() {
+                if Self::tile_overlaps_bounds(coord, bounds) {
+                    tile.last_used = use_stamp;
+                    stroke.draw_to_pixmap(path, &mut tile.pixmap, tile_transform(coord));
+                }
             }
         }
     }
@@ -2465,7 +2507,7 @@ impl ApplicationHandler for MathCanvasApp {
             } => {
                 let pressed = state == ElementState::Pressed;
 
-                // f is edge-triggered so keyboard auto-repeat cannot rapidly
+                // F is edge-triggered so keyboard auto-repeat cannot rapidly
                 // toggle between views. Its release is handled in either mode.
                 if matches!(&logical_key, Key::Character(c) if c.eq_ignore_ascii_case("f")) {
                     if pressed {
@@ -2487,7 +2529,7 @@ impl ApplicationHandler for MathCanvasApp {
                 }
 
                 // Overview is read-only: ignore every application shortcut other
-                // than O/Escape. Window lifecycle and redraw events still work.
+                // than F/Escape. Window lifecycle and redraw events still work.
                 if self.view_mode.is_overview() {
                     return;
                 }
