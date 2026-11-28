@@ -959,6 +959,7 @@ enum InteractionMode {
 struct HeldInputs {
     space: bool,
     shift: bool,
+    control: bool,
     erase: bool,
     invert: bool,
 }
@@ -2251,12 +2252,33 @@ struct CommandBar {
 }
 
 impl CommandBar {
-    fn insert_text(&mut self, text: &str) {
+    fn insert_text(&mut self, text: &str) -> bool {
         let remaining = COMMAND_MAX_INPUT_BYTES.saturating_sub(self.input.len());
-        if remaining == 0 {
-            return;
+        if remaining == 0 || text.is_empty() {
+            return false;
         }
 
+        // Common text input contains no control characters. Insert its largest
+        // UTF-8-safe prefix directly, avoiding a temporary String per keystroke.
+        if !text.chars().any(char::is_control) {
+            let mut accepted_len = 0;
+            for character in text.chars() {
+                let next_len = accepted_len + character.len_utf8();
+                if next_len > remaining {
+                    break;
+                }
+                accepted_len = next_len;
+            }
+            if accepted_len == 0 {
+                return false;
+            }
+            self.input.insert_str(self.cursor, &text[..accepted_len]);
+            self.cursor += accepted_len;
+            self.message = None;
+            return true;
+        }
+
+        // IME commits containing control characters use this filtering path.
         let mut filtered = String::new();
         for character in text.chars().filter(|character| !character.is_control()) {
             if filtered.len() + character.len_utf8() > remaining {
@@ -2265,31 +2287,60 @@ impl CommandBar {
             filtered.push(character);
         }
         if filtered.is_empty() {
-            return;
+            return false;
         }
-
         self.input.insert_str(self.cursor, &filtered);
         self.cursor += filtered.len();
         self.message = None;
+        true
     }
 
-    fn backspace(&mut self) {
+    fn backspace(&mut self) -> bool {
         if self.cursor == 0 {
-            return;
+            return false;
         }
         let previous = self.input[..self.cursor]
             .char_indices()
-            .last()
+            .next_back()
             .map(|(index, _)| index)
             .unwrap_or(0);
         self.input.drain(previous..self.cursor);
         self.cursor = previous;
         self.message = None;
+        true
     }
 
-    fn delete_forward(&mut self) {
+    // Ctrl+Backspace removes preceding whitespace and then the preceding
+    // non-whitespace run. All indices are UTF-8 character boundaries.
+    fn backspace_word(&mut self) -> bool {
+        if self.cursor == 0 {
+            return false;
+        }
+        let mut start = self.cursor;
+        while let Some((index, character)) = self.input[..start].char_indices().next_back() {
+            if !character.is_whitespace() {
+                break;
+            }
+            start = index;
+        }
+        while let Some((index, character)) = self.input[..start].char_indices().next_back() {
+            if character.is_whitespace() {
+                break;
+            }
+            start = index;
+        }
+        if start == self.cursor {
+            return false;
+        }
+        self.input.drain(start..self.cursor);
+        self.cursor = start;
+        self.message = None;
+        true
+    }
+
+    fn delete_forward(&mut self) -> bool {
         if self.cursor >= self.input.len() {
-            return;
+            return false;
         }
         let next = self.input[self.cursor..]
             .chars()
@@ -2298,28 +2349,31 @@ impl CommandBar {
             .unwrap_or(self.cursor);
         self.input.drain(self.cursor..next);
         self.message = None;
+        true
     }
 
-    fn move_left(&mut self) {
+    fn move_left(&mut self) -> bool {
         if self.cursor == 0 {
-            return;
+            return false;
         }
         self.cursor = self.input[..self.cursor]
             .char_indices()
-            .last()
+            .next_back()
             .map(|(index, _)| index)
             .unwrap_or(0);
+        true
     }
 
-    fn move_right(&mut self) {
+    fn move_right(&mut self) -> bool {
         if self.cursor >= self.input.len() {
-            return;
+            return false;
         }
         self.cursor = self.input[self.cursor..]
             .chars()
             .next()
             .map(|ch| self.cursor + ch.len_utf8())
             .unwrap_or(self.input.len());
+        true
     }
 
     fn reset(&mut self) {
@@ -2438,18 +2492,15 @@ fn draw_command_bar(pixmap: &mut Pixmap, command_bar: &CommandBar) -> PixelRect 
     let available_width = width.saturating_sub(text_x.max(0) as u32 + 16) as usize;
     let scroll = cursor_offset.saturating_sub(available_width.saturating_sub(COMMAND_GLYPH_ADVANCE));
 
-    for (index, character) in command_bar.input.chars().enumerate() {
-        let char_x = text_x + (index * COMMAND_GLYPH_ADVANCE) as i32 - scroll as i32;
-        draw_bitmap_text(
-            pixmap,
-            &character.to_string(),
-            char_x,
-            text_y,
-            COMMAND_FONT_SCALE,
-            [226, 231, 239, 255],
-            rect,
-        );
-    }
+    draw_bitmap_text(
+        pixmap,
+        &command_bar.input,
+        text_x - scroll as i32,
+        text_y,
+        COMMAND_FONT_SCALE,
+        [226, 231, 239, 255],
+        rect,
+    );
 
     if !command_bar.preedit.is_empty() {
         let preedit_x = text_x + cursor_offset as i32 - scroll as i32;
@@ -2633,13 +2684,15 @@ impl MathCanvasApp {
         let Some(rect) = self.command_bar_region() else {
             return;
         };
-        if !self.view_mode.is_overview() {
-            self.composite_tiles_into_frame(rect);
-        }
         if self.command_bar.active {
+            // The bar is fully opaque, so repainting its background is enough;
+            // copying the canvas tiles underneath on every keystroke is wasted.
             if let Some(frame) = self.presenter.frame_mut() {
                 draw_command_bar(frame, &self.command_bar);
             }
+        } else if !self.view_mode.is_overview() {
+            // When closing, restore the canvas that the opaque bar covered.
+            self.composite_tiles_into_frame(rect);
         }
         self.presenter.add_damage(rect);
         if let Some(window) = &self.window {
@@ -2810,34 +2863,48 @@ impl MathCanvasApp {
         if !pressed {
             return;
         }
-        match key {
-            Key::Named(NamedKey::Escape) => self.close_command_bar_after_redraw(),
-            Key::Named(NamedKey::Enter) => self.execute_command_bar(),
+
+        let changed = match key {
+            Key::Named(NamedKey::Escape) => {
+                self.close_command_bar_after_redraw();
+                return;
+            }
+            Key::Named(NamedKey::Enter) => {
+                self.execute_command_bar();
+                return;
+            }
             Key::Named(NamedKey::Backspace) => {
-                self.command_bar.backspace();
-                self.refresh_command_bar();
+                if self.interaction.inputs.control {
+                    self.command_bar.backspace_word()
+                } else {
+                    self.command_bar.backspace()
+                }
             }
-            Key::Named(NamedKey::Delete) => {
-                self.command_bar.delete_forward();
-                self.refresh_command_bar();
-            }
-            Key::Named(NamedKey::ArrowLeft) => {
-                self.command_bar.move_left();
-                self.refresh_command_bar();
-            }
-            Key::Named(NamedKey::ArrowRight) => {
-                self.command_bar.move_right();
-                self.refresh_command_bar();
-            }
+            Key::Named(NamedKey::Delete) => self.command_bar.delete_forward(),
+            Key::Named(NamedKey::ArrowLeft) => self.command_bar.move_left(),
+            Key::Named(NamedKey::ArrowRight) => self.command_bar.move_right(),
             Key::Named(NamedKey::Home) => {
-                self.command_bar.cursor = 0;
-                self.refresh_command_bar();
+                if self.command_bar.cursor != 0 {
+                    self.command_bar.cursor = 0;
+                    true
+                } else {
+                    false
+                }
             }
             Key::Named(NamedKey::End) => {
-                self.command_bar.cursor = self.command_bar.input.len();
-                self.refresh_command_bar();
+                let end = self.command_bar.input.len();
+                if self.command_bar.cursor != end {
+                    self.command_bar.cursor = end;
+                    true
+                } else {
+                    false
+                }
             }
-            _ => {}
+            _ => false,
+        };
+
+        if changed {
+            self.refresh_command_bar();
         }
     }
 
@@ -3768,22 +3835,29 @@ impl ApplicationHandler for MathCanvasApp {
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.interaction.inputs.shift = modifiers.state().shift_key();
+                self.interaction.inputs.control = modifiers.state().control_key();
             }
             WindowEvent::Ime(ime) => {
                 if self.command_bar.active {
                     match ime {
                         Ime::Commit(text) => {
+                            let had_preedit = !self.command_bar.preedit.is_empty();
                             self.command_bar.preedit.clear();
-                            self.command_bar.insert_text(&text);
-                            self.refresh_command_bar();
+                            if self.command_bar.insert_text(&text) || had_preedit {
+                                self.refresh_command_bar();
+                            }
                         }
                         Ime::Preedit(text, _) => {
-                            self.command_bar.preedit = text;
-                            self.refresh_command_bar();
+                            if self.command_bar.preedit != text {
+                                self.command_bar.preedit = text;
+                                self.refresh_command_bar();
+                            }
                         }
                         Ime::Disabled => {
-                            self.command_bar.preedit.clear();
-                            self.refresh_command_bar();
+                            if !self.command_bar.preedit.is_empty() {
+                                self.command_bar.preedit.clear();
+                                self.refresh_command_bar();
+                            }
                         }
                         Ime::Enabled => {},
                         _ => {}
@@ -3805,8 +3879,9 @@ impl ApplicationHandler for MathCanvasApp {
                 if self.command_bar.active {
                     if pressed {
                         if let Some(text) = text {
-                            self.command_bar.insert_text(text.as_str());
-                            self.refresh_command_bar();
+                            if self.command_bar.insert_text(text.as_str()) {
+                                self.refresh_command_bar();
+                            }
                         }
                     }
                     self.handle_command_bar_key(logical_key, pressed);
